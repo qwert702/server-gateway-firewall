@@ -18,6 +18,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
+	"fwdd/internal/store"
 )
 
 // Server 是 HTTP 服务。
@@ -56,6 +57,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/confirm", s.handleConfirm)
 	s.mux.HandleFunc("POST "+p+"/rollback", s.handleRollback)
 	s.mux.HandleFunc("GET "+p+"/revisions", s.handleRevisions)
+	s.mux.HandleFunc("GET "+p+"/audit", s.handleAudit)
 	s.mux.HandleFunc("GET "+p+"/bans", s.handleListBans)
 	s.mux.HandleFunc("POST "+p+"/bans", s.handleAddBan)
 	s.mux.HandleFunc("DELETE "+p+"/bans/{ip}", s.handleDeleteBan)
@@ -239,6 +241,22 @@ func (s *Server) handleRollback(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleRevisions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"revisions": s.engine.Revisions()})
+}
+
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request) {
+	limit := intParam(r, "limit", 100)
+	if limit > 1000 {
+		limit = 1000
+	}
+	entries, err := s.engine.AuditLog(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []store.AuditEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"audit": entries, "count": len(entries)})
 }
 
 func (s *Server) handleListBans(w http.ResponseWriter, r *http.Request) {

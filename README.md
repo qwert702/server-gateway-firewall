@@ -12,7 +12,7 @@
 
 ## 当前进度
 
-本项目按里程碑推进，**M1 + M2 已完成**（见下方「路线图」）：
+本项目按里程碑推进，**M1 + M2 + M3 已完成**（见下方「路线图」）：
 
 | 能力 | 状态 |
 | --- | --- |
@@ -22,10 +22,12 @@
 | mock 后端：无内核环境下的联调与单测 | ✅ |
 | `fw` CLI / REST API / commit-confirm 自动回滚 / dry-run | ✅ |
 | YAML 配置与策略基线 | ✅ |
-| SQLite 持久化、NAT 网络配置、自动封禁引擎、GeoIP、Web UI | ⏳ M3–M7 |
+| SQLite 持久化、重启恢复、审计日志 | ✅ |
+| NAT 网络配置、自动封禁引擎、GeoIP、Web UI | ⏳ M4–M7 |
 
-> 尚未实现的部分**不会**静默降级：封禁目前写入期望状态与内核集合，但重启后需由
-> 策略文件重建（M3 引入 SQLite 后改为自动恢复）。
+> 驱动真实 `nft` 的测试在无 nft 或非 root 环境下自动跳过，因此 `go test ./...`
+> 在 Windows/macOS 上也能跑；生成的规则集**尚未在真机校验过语法**，
+> 请在 Linux 上执行 `sudo make verify-nft` 补上这一步。
 
 ---
 
@@ -81,6 +83,46 @@ sudo ./bin/fwdd -config /etc/fwdd/config.yaml -dry-run
 #   规则已生效；若 60 秒内没有执行下面的命令，自动回滚到变更前的状态
 ./bin/fw -config /etc/fwdd/config.yaml confirm
 ```
+
+---
+
+## 持久化与重启恢复
+
+状态存在 SQLite 里（`modernc.org/sqlite`，纯 Go，无 cgo），默认位于
+`<data_dir>/fwdd.db`：
+
+| 表 | 内容 |
+| --- | --- |
+| `policy` | 单行，完整期望状态 JSON。一次修改天然是一个事务，不会出现半截状态 |
+| `ban_entries` | 封禁记录。写入频繁、需按到期时间清理，故单独建表 |
+| `audit_log` | 只追加：谁在什么时候改了什么 |
+| `kv` | 元数据，如上次成功下发的哈希（供重启后对账） |
+
+**权威顺序**：数据库中的策略 > 策略文件。策略文件只是**首次启动**的初始值，
+之后再改文件不会生效（避免一个陈旧的文件悄悄覆盖管理员的最新编辑）。
+要强制用文件覆盖：
+
+```bash
+sudo ./bin/fwdd -config /etc/fwdd/config.yaml -import-policy
+```
+
+**封禁只有一份**，存在 `ban_entries` 表里。策略 JSON 中不含封禁 —— 两份副本
+必然漂移。因此 `fw policy set` / `PUT /policy` **不会**清掉封禁（早期版本会，
+表现为"解封了但重启后全部复活"）。启动时若数据库为空，策略文件里的 `bans:`
+会被导入该表；已过期的条目在启动时直接清理，不会被重新注入。
+
+演示或测试可以用 `-no-persist`（或配置 `disable_persist: true`）关掉持久化，
+此时策略与封禁只存在于内存，重启即遗忘。
+
+### 重启恢复顺序
+
+```
+打开数据库 → 清理过期封禁 → 从库读策略（无则用策略文件初始化）
+  → 编译 → 单事务下发内核 → 重新注入封禁集合 → 启动 REST API
+```
+
+启动时的下发**不进入 commit-confirm 窗口**：本地策略文件是可信基线，
+无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
 
 ---
 
@@ -198,6 +240,7 @@ fw plan [-o json]                    预览差异（不下发）
 fw ruleset                           打印完整 nft 规则集
 fw apply [--dry-run] [--confirm] [--timeout 秒]
 fw confirm / fw rollback / fw revisions
+fw audit [-n 条数]                    操作审计日志
 fw policy get|set -f 文件 [--apply]
 fw zone list / fw rule list
 fw ban add <ip> [--ttl 秒] [--reason 文本] | fw ban list | fw ban rm <ip>
@@ -222,6 +265,7 @@ fw ban add <ip> [--ttl 秒] [--reason 文本] | fw ban list | fw ban rm <ip>
 | POST | `/apply` | 下发（`?dry_run` `?confirm` `?timeout`） |
 | POST | `/confirm` `/rollback` | 确认 / 回滚 |
 | GET | `/revisions` | 下发历史 |
+| GET | `/audit` | 操作审计日志（`?limit=`） |
 | GET/POST | `/bans`，DELETE `/bans/{ip}` | 封禁管理 |
 | GET | `/zones` `/rules` `/config` | 策略与配置查询 |
 
@@ -253,6 +297,7 @@ internal/backend/    后端接口 + nftables 实现 + mock 实现
 internal/engine/     期望/已应用状态机、commit-confirm、回滚、封禁
 internal/api/        REST 接口与认证
 internal/client/     CLI 用的 API 客户端（Unix 套接字优先）
+internal/store/      SQLite 持久化（策略、封禁、审计、元数据）
 internal/config/     守护进程配置加载与校验
 configs/             配置与策略示例
 deploy/              验证脚本与 systemd 单元（M7 完善）
@@ -283,7 +328,7 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 
 - **M1 + M2（已完成）** 骨架、后端抽象、模型、编译器、原子下发、dry-run、
   commit-confirm、CLI 与 REST API。
-- **M3** SQLite 持久化与重启恢复；规则 CRUD 与排序；快照管理。
+- **M3（已完成）** SQLite 持久化与重启恢复、审计日志、过期封禁清理。
 - **M4** NAT 完整落地；用 netlink 配置接口/地址/路由/`ip rule`/转发 sysctl。
 - **M5** 限速与自动封禁引擎（conntrack 探测、日志解析、递增惩罚、白名单豁免）。
 - **M6** 认证与审计完善、Prometheus 指标、SSE 实时连接与日志、内嵌 Web UI。
@@ -293,7 +338,6 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 
 ## 已知限制
 
-- 策略目前保存在内存中，重启后由策略文件重建（M3 引入 SQLite 后自动恢复）。
 - 尚未接管接口/路由配置，只负责过滤与 NAT 规则本身。
 - 未与既有 iptables 规则做共存策略；同一钩子上二者会按 priority 排序，接管前请确认。
 - GeoIP、连接数统计、日志流等读取类接口尚未实现。

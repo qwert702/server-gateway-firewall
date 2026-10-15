@@ -28,6 +28,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/ir"
 	"fwdd/internal/model"
+	"fwdd/internal/store"
 )
 
 // ErrPendingCommit 表示已有一个 commit-confirm 在等待确认。
@@ -45,6 +46,8 @@ type Engine struct {
 	copts   compiler.Options
 	log     *slog.Logger
 	clock   func() time.Time
+	// db 为 nil 时表示不持久化（纯内存运行，重启即遗忘）。
+	db *store.DB
 
 	desired  *model.Policy
 	applied  *model.Policy
@@ -60,9 +63,39 @@ type Engine struct {
 	revisions          []Revision
 	seq                int
 
+	// actor 记录当前操作的发起者，写入审计日志。
+	actor string
+
 	// onAutoRollback 在自动回滚发生后被调用（用于审计/告警）。
 	onAutoRollback func(to *model.Policy)
 }
+
+// Option 配置引擎。
+type Option func(*Engine)
+
+// WithStore 挂载持久化存储。
+func WithStore(db *store.DB) Option { return func(e *Engine) { e.db = db } }
+
+// WithLogger 指定日志器。
+func WithLogger(l *slog.Logger) Option {
+	return func(e *Engine) {
+		if l != nil {
+			e.log = l
+		}
+	}
+}
+
+// WithClock 注入时钟（测试用）。
+func WithClock(fn func() time.Time) Option {
+	return func(e *Engine) {
+		if fn != nil {
+			e.clock = fn
+		}
+	}
+}
+
+// WithActor 设置审计记录中的操作者标识。
+func WithActor(actor string) Option { return func(e *Engine) { e.actor = actor } }
 
 // PendingCommit 描述一个等待确认的变更。
 type PendingCommit struct {
@@ -82,7 +115,7 @@ type Revision struct {
 }
 
 // New 创建引擎。
-func New(cfg config.Config, b backend.Backend, logger *slog.Logger) *Engine {
+func New(cfg config.Config, b backend.Backend, logger *slog.Logger, opts ...Option) *Engine {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -91,6 +124,7 @@ func New(cfg config.Config, b backend.Backend, logger *slog.Logger) *Engine {
 		backend: b,
 		log:     logger,
 		clock:   time.Now,
+		actor:   "local",
 		copts: compiler.Options{
 			TableName:         cfg.Table,
 			Family:            ir.Family(cfg.Family),
@@ -102,6 +136,9 @@ func New(cfg config.Config, b backend.Backend, logger *slog.Logger) *Engine {
 		},
 		desired: &model.Policy{},
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
 	return e
 }
 
@@ -111,22 +148,250 @@ func (e *Engine) Options() compiler.Options { return e.copts }
 // Backend 返回后端。
 func (e *Engine) Backend() backend.Backend { return e.backend }
 
+// Store 返回持久化存储；未配置时为 nil。
+func (e *Engine) Store() *store.DB { return e.db }
+
+// ---- 持久化 ----
+
+// persistTimeout 限制单次持久化耗时，避免磁盘异常时拖住整个管理接口。
+const persistTimeout = 5 * time.Second
+
+// persistPolicyLocked 保存期望状态。调用方必须持有 e.mu。
+//
+// 封禁项会被剔除后再存：它们由 store 的 ban_entries 表单独管理
+// （写入频繁、需按到期时间查询）。两份副本必然漂移，因此只保留一份。
+//
+// 写入失败不回滚内存状态：内存与磁盘不一致时，宁可让当前会话继续可用，
+// 也要留下明确的错误日志。
+func (e *Engine) persistPolicyLocked() {
+	if e.db == nil {
+		return
+	}
+	p := deepCopy(e.desired)
+	p.Bans = nil
+
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
+	defer cancel()
+	if err := e.db.SavePolicy(ctx, p); err != nil {
+		e.log.Error("保存期望状态失败", "err", err)
+	}
+}
+
+// persistBan 写入封禁记录。
+func (e *Engine) persistBan(ctx context.Context, b model.BanEntry) {
+	if e.db == nil {
+		return
+	}
+	if err := e.db.UpsertBan(ctx, b); err != nil {
+		e.log.Error("保存封禁失败", "err", err, "ip", b.IP)
+	}
+}
+
+// forgetBan 删除封禁记录。
+func (e *Engine) forgetBan(ctx context.Context, ip string) {
+	if e.db == nil {
+		return
+	}
+	if err := e.db.DeleteBan(ctx, ip); err != nil {
+		e.log.Error("删除封禁记录失败", "err", err, "ip", ip)
+	}
+}
+
+// audit 记录一条审计日志。db 为 nil 时静默跳过。
+func (e *Engine) audit(action, target, detail string) {
+	if e.db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), persistTimeout)
+	defer cancel()
+	err := e.db.AppendAudit(ctx, store.AuditEntry{
+		At:     e.clock(),
+		Actor:  e.actor,
+		Action: action,
+		Target: target,
+		Detail: detail,
+	})
+	if err != nil {
+		e.log.Error("写入审计日志失败", "err", err, "action", action)
+	}
+}
+
+// AuditLog 返回最近的审计记录。
+func (e *Engine) AuditLog(ctx context.Context, limit int) ([]store.AuditEntry, error) {
+	if e.db == nil {
+		return nil, nil
+	}
+	return e.db.ListAudit(ctx, limit)
+}
+
+// Restore 从存储加载期望状态与封禁，用于进程启动。
+//
+// 优先级：数据库中的策略 > 传入的基线（策略文件）。
+// 数据库记录的是管理员最近一次编辑的结果，不应该被一个陈旧的文件覆盖；
+// 策略文件只在数据库为空（首次启动）时充当初始值。
+//
+// 返回是否从数据库加载了策略。
+func (e *Engine) Restore(ctx context.Context, baseline *model.Policy) (fromDB bool, err error) {
+	if e.db == nil {
+		if baseline == nil {
+			return false, nil
+		}
+		// 无持久化时，策略文件就是唯一的真相来源，封禁直接采用文件里的。
+		np, err := e.prepare(baseline)
+		if err != nil {
+			return false, err
+		}
+		e.mu.Lock()
+		e.desired = np
+		e.mu.Unlock()
+		return false, nil
+	}
+
+	// 清理早已过期的封禁：内核靠 timeout 自动到期，SQLite 不会，
+	// 不清理就会在每次重启时把它们重新注入回去。
+	if n, err := e.db.PruneExpiredBans(ctx, e.clock()); err != nil {
+		e.log.Warn("清理过期封禁失败", "err", err)
+	} else if n > 0 {
+		e.log.Info("已清理过期封禁", "count", n)
+	}
+
+	p, err := e.db.LoadPolicy(ctx)
+	switch {
+	case errors.Is(err, store.ErrNoPolicy):
+		if baseline == nil {
+			e.log.Warn("数据库与策略文件均为空，期望状态为空（只有默认策略生效）")
+			return false, nil
+		}
+		np, err := e.prepare(baseline)
+		if err != nil {
+			return false, fmt.Errorf("初始策略校验失败: %w", err)
+		}
+		// 首次启动才采用策略文件里的封禁列表，写入 ban_entries 成为权威副本。
+		seeded := 0
+		for _, b := range np.Bans {
+			if b.Expired(e.clock()) {
+				continue
+			}
+			if err := e.db.UpsertBan(ctx, b); err != nil {
+				return false, fmt.Errorf("导入基线封禁失败: %w", err)
+			}
+			seeded++
+		}
+		bans, err := e.db.LoadBans(ctx, e.clock())
+		if err != nil {
+			return false, err
+		}
+
+		e.mu.Lock()
+		np.Bans = bans
+		e.desired = np
+		e.persistPolicyLocked()
+		e.mu.Unlock()
+
+		e.audit("policy.init", "", fmt.Sprintf("来自策略文件 rules=%d bans=%d", len(np.Rules), seeded))
+		e.log.Info("首次启动：已用策略文件初始化数据库",
+			"rules", len(np.Rules), "bans", seeded)
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+
+	bans, err := e.db.LoadBans(ctx, e.clock())
+	if err != nil {
+		return false, err
+	}
+	np, err := e.prepare(p)
+	if err != nil {
+		return false, fmt.Errorf("数据库中的策略已不合法（可能来自旧版本）: %w", err)
+	}
+
+	// 直接落状态而不是走 SetPolicy：后者会保留当前内存中的封禁列表，
+	// 而此刻要的正是刚刚从库里读出来的那一份。
+	e.mu.Lock()
+	np.Bans = bans
+	e.desired = np
+	e.mu.Unlock()
+
+	e.log.Info("已从数据库恢复期望状态",
+		"zones", len(np.Zones), "rules", len(np.Rules), "bans", len(bans))
+	return true, nil
+}
+
+// pruneLoop 周期性清理过期封禁。
+func (e *Engine) pruneLoop(ctx context.Context, every time.Duration) {
+	if e.db == nil || every <= 0 {
+		return
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n, err := e.db.PruneExpiredBans(ctx, e.clock())
+			if err != nil {
+				e.log.Warn("清理过期封禁失败", "err", err)
+				continue
+			}
+			if n > 0 {
+				e.log.Info("已清理过期封禁", "count", n)
+				// 同步剔除内存中的过期项。
+				_ = e.Update(func(p *model.Policy) error {
+					now := e.clock()
+					out := p.Bans[:0]
+					for _, b := range p.Bans {
+						if !b.Expired(now) {
+							out = append(out, b)
+						}
+					}
+					p.Bans = out
+					return nil
+				})
+			}
+		}
+	}
+}
+
+// StartMaintenance 启动后台维护（过期封禁清理），随 ctx 结束而停止。
+func (e *Engine) StartMaintenance(ctx context.Context) {
+	go e.pruneLoop(ctx, 5*time.Minute)
+}
+
 // ---- 期望状态 ----
 
-// SetPolicy 替换期望状态（仅内存，需 Apply 才生效）。
+// SetPolicy 替换期望状态（仅内存 + 持久化，需 Apply 才下发到内核）。
+//
+// 传入策略的 Bans 字段会被忽略：封禁由 store 的 ban_entries 表统一管理，
+// 与规则分离。若直接采用调用方给的空封禁列表，内存与数据库就会不一致，
+// 表现为"解封了"但重启后又全部复活。
 func (e *Engine) SetPolicy(p *model.Policy) error {
+	np, err := e.prepare(p)
+	if err != nil {
+		return err
+	}
+	e.mu.Lock()
+	np.Bans = append([]model.BanEntry(nil), e.desired.Bans...)
+	e.desired = np
+	e.persistPolicyLocked()
+	e.mu.Unlock()
+
+	e.audit("policy.set", "", fmt.Sprintf("zones=%d rules=%d nat=%d",
+		len(np.Zones), len(np.Rules), len(np.NATRules)))
+	return nil
+}
+
+// prepare 校验并规范化一份策略，不改变引擎状态。
+func (e *Engine) prepare(p *model.Policy) (*model.Policy, error) {
 	if p == nil {
-		return errors.New("策略为空")
+		return nil, errors.New("策略为空")
 	}
 	np := deepCopy(p)
 	np.Normalize()
 	if errs := model.Errors(np.Validate()); len(errs) > 0 {
-		return &compiler.ValidationError{Problems: errs}
+		return nil, &compiler.ValidationError{Problems: errs}
 	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.desired = np
-	return nil
+	return np, nil
 }
 
 // Policy 返回期望状态（深拷贝，调用方可安全修改）。
@@ -151,6 +416,7 @@ func (e *Engine) Update(fn func(p *model.Policy) error) error {
 		return &compiler.ValidationError{Problems: errs}
 	}
 	e.desired = next
+	e.persistPolicyLocked()
 	return nil
 }
 
@@ -329,12 +595,24 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, er
 
 	out.Applied = true
 	e.log.Info("策略已下发", "rules", out.Rules, "hash", out.Hash, "pending_confirm", out.Pending != nil)
+	e.recordApplied(ctx, out.Hash)
+	e.audit("apply", out.Hash, fmt.Sprintf("rules=%d changed=%v note=%s", out.Rules, out.Changed, opts.Note))
 
 	// 规则集替换会重建封禁集合（集合本身是空的），因此下发后必须重新注入封禁。
 	if err := e.syncBanSets(ctx); err != nil {
 		e.log.Error("下发后重建封禁集合失败", "err", err)
 	}
 	return out, nil
+}
+
+// recordApplied 记录本次成功下发的哈希，供重启后对账。
+func (e *Engine) recordApplied(ctx context.Context, hash string) {
+	if e.db == nil {
+		return
+	}
+	if err := e.db.PutKV(ctx, "applied_hash", hash); err != nil {
+		e.log.Error("记录下发哈希失败", "err", err)
+	}
 }
 
 // syncBanSets 把期望状态中的封禁条目重新注入内核集合。
@@ -436,6 +714,7 @@ func (e *Engine) Confirm() error {
 	e.pending = nil
 	e.pendingTarget = nil
 	e.log.Info("变更已确认")
+	e.audit("confirm", "", "")
 	return nil
 }
 
@@ -486,7 +765,11 @@ func (e *Engine) undo(ctx context.Context, target *model.Policy, targetValid boo
 		e.revisions = append(e.revisions, Revision{
 			Seq: e.seq, At: e.clock(), Note: note, Rules: 0,
 		})
+		e.persistPolicyLocked()
 		e.mu.Unlock()
+
+		e.recordApplied(ctx, "")
+		e.audit("rollback.reset", "", note)
 		e.log.Warn("已撤销全部规则", "note", note)
 		return nil
 	}
@@ -505,17 +788,22 @@ func (e *Engine) restore(ctx context.Context, target *model.Policy, note string)
 	if err := e.backend.Apply(ctx, res.Snapshot); err != nil {
 		return err
 	}
+	h := hash(text)
 	e.mu.Lock()
 	e.prev = e.applied
 	e.desired = deepCopy(target)
 	e.applied = deepCopy(target)
 	e.hasState = true
-	e.appliedHash = hash(text)
+	e.appliedHash = h
 	e.seq++
 	e.revisions = append(e.revisions, Revision{
-		Seq: e.seq, At: e.clock(), Hash: hash(text), Rules: res.Snapshot.RuleCount(), Note: note,
+		Seq: e.seq, At: e.clock(), Hash: h, Rules: res.Snapshot.RuleCount(), Note: note,
 	})
+	e.persistPolicyLocked()
 	e.mu.Unlock()
+
+	e.recordApplied(ctx, h)
+	e.audit("rollback", h, note)
 	e.log.Warn("已回滚", "note", note, "rules", res.Snapshot.RuleCount())
 	if err := e.syncBanSets(ctx); err != nil {
 		e.log.Error("回滚后重建封禁集合失败", "err", err)
@@ -648,6 +936,9 @@ func (e *Engine) Ban(ctx context.Context, entry model.BanEntry) error {
 	if set == "" {
 		return fmt.Errorf("未配置封禁集合，无法注入 %s", ip)
 	}
+	e.persistBan(ctx, entry)
+	e.audit("ban.add", ip, entry.Reason)
+
 	// 立即注入内核，不必等到下一次 apply。
 	return e.backend.SetAdd(ctx, set, ir.Element{
 		Key: ip, Timeout: entry.TTL(now), Comment: entry.Reason,
@@ -668,6 +959,9 @@ func (e *Engine) Unban(ctx context.Context, ip string) error {
 	}); err != nil {
 		return err
 	}
+	e.forgetBan(ctx, ip)
+	e.audit("ban.remove", ip, "")
+
 	set := compiler.BanSetFor(ip, e.copts.BanSet4, e.copts.BanSet6)
 	if set == "" {
 		return nil

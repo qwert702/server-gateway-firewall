@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
+	"fwdd/internal/store"
 	"gopkg.in/yaml.v3"
 )
 
@@ -35,14 +37,17 @@ func main() {
 
 func run() error {
 	var (
-		cfgPath     = flag.String("config", defaultConfigPath(), "配置文件路径（缺失时自动生成）")
-		backendName = flag.String("backend", "", "覆盖配置中的后端：nftables | mock")
-		listen      = flag.String("listen", "", "覆盖 HTTP 监听地址")
-		policyPath  = flag.String("policy", "", "策略文件路径（YAML）")
-		applyStart  = flag.Bool("apply-on-start", true, "启动时把策略下发到内核")
-		dryRun      = flag.Bool("dry-run", false, "只渲染不下发，打印规则集后退出")
-		logLevel    = flag.String("log-level", "", "覆盖日志级别：debug|info|warn|error")
-		version     = flag.Bool("version", false, "打印版本并退出")
+		cfgPath      = flag.String("config", defaultConfigPath(), "配置文件路径（缺失时自动生成）")
+		backendName  = flag.String("backend", "", "覆盖配置中的后端：nftables | mock")
+		listen       = flag.String("listen", "", "覆盖 HTTP 监听地址")
+		policyPath   = flag.String("policy", "", "策略文件路径（YAML）")
+		applyStart   = flag.Bool("apply-on-start", true, "启动时把策略下发到内核")
+		dryRun       = flag.Bool("dry-run", false, "只渲染不下发，打印规则集后退出")
+		noPersist    = flag.Bool("no-persist", false, "关闭持久化（策略与封禁只留在内存）")
+		importPolicy = flag.Bool("import-policy", false, "用 -policy 文件覆盖数据库中的期望状态")
+		actor        = flag.String("actor", "fwdd", "审计日志中的操作者标识")
+		logLevel     = flag.String("log-level", "", "覆盖日志级别：debug|info|warn|error")
+		version      = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
 
@@ -81,21 +86,51 @@ func run() error {
 	defer be.Close()
 	logger.Info("后端就绪", "backend", be.Name(), "table", cfg.Table, "family", cfg.Family)
 
-	eng := engine.New(cfg, be, logger)
+	// 打开持久化存储。
+	var db *store.DB
+	if !*noPersist && !cfg.DisablePersist {
+		path := cfg.DBPath
+		if path == "" {
+			path = filepath.Join(cfg.DataDir, "fwdd.db")
+		}
+		db, err = store.Open(path)
+		if err != nil {
+			return fmt.Errorf("打开数据库失败: %w", err)
+		}
+		defer db.Close()
+		logger.Info("已打开数据库", "path", path)
+	} else {
+		logger.Warn("持久化已关闭：策略与封禁只存在于内存，重启即遗忘")
+	}
 
-	// 加载策略基线。
+	eng := engine.New(cfg, be, logger, engine.WithStore(db), engine.WithActor(*actor))
+
+	// 加载策略文件作为基线（仅在数据库为空时使用）。
+	var baseline *model.Policy
 	if cfg.PolicyFile != "" {
 		p, err := loadPolicy(cfg.PolicyFile)
 		if err != nil {
 			return fmt.Errorf("加载策略 %s 失败: %w", cfg.PolicyFile, err)
 		}
-		if err := eng.SetPolicy(p); err != nil {
-			return err
-		}
-		logger.Info("已加载策略基线", "path", cfg.PolicyFile,
+		baseline = p
+		logger.Info("已读取策略基线", "path", cfg.PolicyFile,
 			"zones", len(p.Zones), "rules", len(p.Rules))
-	} else {
-		logger.Warn("未指定策略文件，期望状态为空（只有默认策略生效）")
+	}
+
+	fromDB, err := eng.Restore(context.Background(), baseline)
+	if err != nil {
+		return err
+	}
+	if *importPolicy {
+		if baseline == nil {
+			return errors.New("-import-policy 需要同时指定 -policy 策略文件")
+		}
+		if err := eng.SetPolicy(baseline); err != nil {
+			return fmt.Errorf("导入策略失败: %w", err)
+		}
+		logger.Info("已用策略文件覆盖数据库中的期望状态", "path", cfg.PolicyFile)
+	} else if fromDB {
+		logger.Info("数据库中的策略优先于策略文件（如需用文件覆盖请加 -import-policy）")
 	}
 
 	if *dryRun {
@@ -122,6 +157,9 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// 后台维护：定期清理已过期的封禁记录。
+	eng.StartMaintenance(ctx)
 
 	srv := api.New(cfg, eng, logger)
 	logger.Info("fwdd 启动完成", "backend", be.Name())

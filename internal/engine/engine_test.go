@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -35,7 +37,7 @@ func basePolicy() *model.Policy {
 func newEngine(t *testing.T) (*Engine, *mock.Backend) {
 	t.Helper()
 	be := mock.New(mock.WithTableName("fw"))
-	e := New(testConfig(), be, nil)
+	e := New(testConfig(), be, quietLogger())
 	return e, be
 }
 
@@ -508,7 +510,7 @@ func TestForceNoConfirmSkipsRollbackWindow(t *testing.T) {
 	cfg := testConfig()
 	cfg.CommitConfirm = config.CommitConfirm{Enabled: true, Timeout: 150 * time.Millisecond}
 	be := mock.New(mock.WithTableName("fw"))
-	e := New(cfg, be, nil)
+	e := New(cfg, be, quietLogger())
 
 	if err := e.SetPolicy(basePolicy()); err != nil {
 		t.Fatal(err)
@@ -532,7 +534,7 @@ func TestForceNoConfirmSkipsRollbackWindow(t *testing.T) {
 func TestConfigEnabledConfirmStillApplies(t *testing.T) {
 	cfg := testConfig()
 	cfg.CommitConfirm = config.CommitConfirm{Enabled: true, Timeout: 3 * time.Second}
-	e := New(cfg, mock.New(mock.WithTableName("fw")), nil)
+	e := New(cfg, mock.New(mock.WithTableName("fw")), quietLogger())
 
 	if err := e.SetPolicy(basePolicy()); err != nil {
 		t.Fatal(err)
@@ -547,4 +549,9 @@ func TestConfigEnabledConfirmStillApplies(t *testing.T) {
 	if err := e.Confirm(); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// quietLogger 让测试输出不被引擎日志淹没；需要看日志时改成 os.Stderr 即可。
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }

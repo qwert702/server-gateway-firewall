@@ -9,3 +9,8 @@
 .idea/
 .vscode/
 *.swp
+
+# 本地数据库（含 WAL / SHM 边文件）
+*.db
+*.db-wal
+*.db-shm

@@ -29,9 +29,15 @@ type Config struct {
 	Table  string `yaml:"table" json:"table"`
 	Family string `yaml:"family" json:"family"`
 
-	// DataDir 存放运行时数据（快照、审计）。
+	// DataDir 存放运行时数据（SQLite 数据库、快照）。
 	DataDir string `yaml:"data_dir" json:"data_dir"`
-	// PolicyFile 为声明式基线策略文件（YAML）；存在则作为初始期望状态。
+	// DBPath 覆盖 SQLite 数据库路径；空则使用 DataDir/fwdd.db。
+	DBPath string `yaml:"db_path" json:"db_path"`
+	// DisablePersist 关闭持久化：策略与封禁只存在于内存，重启即遗忘。
+	// 仅用于演示与测试。
+	DisablePersist bool `yaml:"disable_persist" json:"disable_persist"`
+	// PolicyFile 为声明式基线策略文件（YAML）；
+	// 仅在该数据库尚无策略（首次启动）时作为初始期望状态。
 	PolicyFile string `yaml:"policy_file" json:"policy_file"`
 
 	// Token 为 HTTP API 的 Bearer 令牌；空表示不校验（仅回环）。

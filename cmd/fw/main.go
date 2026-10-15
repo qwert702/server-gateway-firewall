@@ -20,6 +20,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
+	"fwdd/internal/store"
 	"gopkg.in/yaml.v3"
 )
 
@@ -34,6 +35,7 @@ const usage = `fw —— 服务器网关防火墙命令行
   fw confirm                       确认变更（取消自动回滚倒计时）
   fw rollback                      回滚到上一个版本
   fw revisions                     查看看下发历史
+  fw audit [-n 条数]                查看操作审计日志
 
   fw policy get [-o json]          查看完整策略
   fw policy set -f 文件.yaml [--apply]
@@ -118,6 +120,8 @@ func run(args []string, out *os.File) error {
 		return nil
 	case "revisions":
 		return cmdRevisions(ctx, c, out, format)
+	case "audit":
+		return cmdAudit(ctx, c, out, format, sub)
 	case "policy":
 		return cmdPolicy(ctx, c, out, format, sub)
 	case "zone":
@@ -298,6 +302,35 @@ func cmdRevisions(ctx context.Context, c *client.Client, out *os.File, format st
 	fmt.Fprintln(w, "序号\t时间\t规则数\t哈希\t说明")
 	for _, r := range resp.Revisions {
 		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\n", r.Seq, r.At.Format("01-02 15:04:05"), r.Rules, r.Hash, orDash(r.Note))
+	}
+	return w.Flush()
+}
+
+func cmdAudit(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	fs := flag.NewFlagSet("audit", flag.ContinueOnError)
+	limit := fs.Int("n", 50, "返回的记录条数上限")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+
+	var resp struct {
+		Audit []store.AuditEntry `json:"audit"`
+	}
+	if err := c.Get(ctx, client.Query("/audit", map[string]string{"limit": strconv.Itoa(*limit)}), &resp); err != nil {
+		return err
+	}
+	if format == "json" {
+		return printJSON(out, resp.Audit)
+	}
+	if len(resp.Audit) == 0 {
+		fmt.Fprintln(out, "（暂无审计记录）")
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "时间\t操作者\t动作\t对象\t详情")
+	for _, e := range resp.Audit {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			e.At.Format("01-02 15:04:05"), orDash(e.Actor), e.Action, orDash(e.Target), orDash(e.Detail))
 	}
 	return w.Flush()
 }

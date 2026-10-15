@@ -16,10 +16,17 @@ backend: nftables
 table: fw
 family: inet
 
-# 运行时数据目录（快照、审计，后续里程碑使用）
+# 运行时数据目录。SQLite 数据库默认放在这里（<data_dir>/fwdd.db）。
 data_dir: /var/lib/fwdd
 
-# 声明式策略基线。启动时会加载为期望状态并下发。
+# 覆盖数据库路径；留空则使用 <data_dir>/fwdd.db。
+db_path: ""
+
+# 关闭持久化：策略与封禁只存在于内存，重启即遗忘。仅用于演示与测试。
+disable_persist: false
+
+# 声明式策略基线。注意：只在该数据库尚无策略（首次启动）时作为初始期望状态，
+# 之后修改本文件不会生效 —— 数据库中的版本优先。要强制覆盖请启动时加 -import-policy。
 policy_file: /etc/fwdd/policy.yaml
 
 # API 令牌。非回环监听时必填；Linux 上建议 0600 存放于 /etc/fwdd/token。
