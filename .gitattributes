@@ -1,0 +1,20 @@
+# 统一换行符为 LF。
+#
+# 本项目在 Windows 上开发、在 Linux 上运行，而 shell 脚本里的
+# `#!/usr/bin/env bash` 一旦带上 CRLF 就会在 Linux 上直接执行失败。
+# 这里同时固定仓库内与工作区的换行符，避免 checkout 时又被改成 CRLF。
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.go      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.md      text eol=lf
+*.service text eol=lf
+Makefile  text eol=lf
+
+# 二进制文件不做换行符转换
+*.exe   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary

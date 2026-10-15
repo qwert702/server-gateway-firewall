@@ -1,0 +1,132 @@
+# 声明式策略基线示例：一个典型的三接口网关
+#
+#   eth0 = wan  (不可信，接入互联网)
+#   eth1 = lan  (可信内网)
+#   eth2 = dmz  (缓冲区分段，对外提供服务)
+#
+# 语义要点：
+#   - 域的网段只在"该域未绑定接口"时参与匹配；绑定接口时以接口为边界。
+#   - zone 名 local 表示防火墙本机；any / 空 表示不施加该方向约束。
+#   - default 是各内置链的兜底策略，务必保持 forward: drop。
+
+version: 1
+
+zones:
+  - name: wan
+    interfaces: [eth0]
+    trust: untrusted
+  - name: lan
+    interfaces: [eth1]
+    trust: lan
+  - name: dmz
+    interfaces: [eth2]
+    trust: dmz
+
+rules:
+  # ---- 放行已建立连接（网关必备，否则回包会被丢弃）----
+  - id: est-rel
+    priority: 1
+    src_zone: any
+    dst_zone: any
+    state: [established, related]
+    action: accept
+    comment: 已建立/相关连接的快速通道
+
+  # ---- 内网出访 ----
+  - id: lan-to-wan
+    priority: 100
+    src_zone: lan
+    dst_zone: wan
+    action: accept
+    comment: 内网访问互联网
+
+  - id: lan-to-dmz-web
+    priority: 110
+    src_zone: lan
+    dst_zone: dmz
+    proto: tcp
+    dst_port: ["80", "443"]
+    state: [new]
+    action: accept
+    comment: 内网访问 DMZ 的 Web
+
+  # ---- 外网进内网：只放行已建立，其余明确拒绝 ----
+  - id: wan-to-dmz-web
+    priority: 200
+    src_zone: wan
+    dst_zone: dmz
+    proto: tcp
+    dst_port: ["80", "443"]
+    state: [new]
+    action: accept
+    limit: {rate: 200, per: second, burst: 400}
+    comment: 外网访问 DMZ Web（带源无关的全局限速）
+
+  - id: wan-deny-dmz
+    priority: 250
+    src_zone: wan
+    dst_zone: dmz
+    action: log
+    log_prefix: "fw-deny-wan-dmz: "
+    comment: 记录其余外网到 DMZ 的尝试
+
+  # ---- 本机管理面（务必保留，否则会把自己锁在门外）----
+  - id: ssh-from-lan
+    priority: 300
+    src_zone: lan
+    dst_zone: local
+    proto: tcp
+    dst_port: ["22"]
+    state: [new, established]
+    action: accept
+    limit: {rate: 10, per: minute, burst: 20, per_ip: true}
+    comment: 仅允许内网 SSH 管理
+
+  - id: icmp-from-lan
+    priority: 310
+    src_zone: lan
+    dst_zone: local
+    proto: icmp
+    action: accept
+    limit: {rate: 10, per: second, burst: 20}
+    comment: 限速 ICMP，兼顾诊断与抗洪
+
+  # ---- 丢弃非法状态包 ----
+  - id: drop-invalid
+    priority: 900
+    src_zone: any
+    dst_zone: any
+    state: [invalid]
+    action: drop
+    comment: 丢弃非法连接状态
+
+nat_rules:
+  # DMZ 内的 Web 服务器通过网关的 8080 端口对外提供服务
+  - id: dmz-web
+    priority: 100
+    kind: dnat
+    proto: tcp
+    src_zone: wan
+    match_port: "8080"
+    to_addr: 192.168.20.10
+    to_port: "80"
+    comment: 对外暴露 DMZ Web
+
+  # 内网与 DMZ 出访时做源地址伪装
+  - id: masq-wan
+    priority: 200
+    kind: masquerade
+    out_zone: wan
+    comment: 出网口伪装
+
+default:
+  # 输入/转发默认拒绝；输出放行（本机主动发起的流量）。
+  input: drop
+  forward: drop
+  output: accept
+
+ban_settings:
+  timeout: 24h
+  whitelist:
+    - 10.0.0.0/8
+    - 127.0.0.0/8

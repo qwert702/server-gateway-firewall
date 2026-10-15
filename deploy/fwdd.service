@@ -1,0 +1,37 @@
+[Unit]
+Description=fwdd 网关防火墙守护进程
+Documentation=https://example.invalid/fwdd
+# 必须在网络就绪之后启动；nftables 由本服务独占管理。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/fwdd -config /etc/fwdd/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+
+# 需要操作 netfilter 与网络配置，因此保留 CAP_NET_ADMIN。
+User=root
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+# 收紧文件系统视图：只需要配置与运行时数据目录。
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/fwdd /run
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=false
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# 日志进 journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fwdd
+
+[Install]
+WantedBy=multi-user.target

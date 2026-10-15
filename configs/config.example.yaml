@@ -1,0 +1,37 @@
+# fwdd 守护进程配置示例
+#
+# 复制到 /etc/fwdd/config.yaml（Linux）或 %ProgramData%\fwdd\config.yaml（Windows）。
+
+# HTTP 管理接口。默认只监听回环；若改成 0.0.0.0 则必须同时设置 token。
+listen: 127.0.0.1:8080
+
+# Unix 域套接字。Linux 上推荐只保留套接字并关闭 TCP；
+# Windows 不支持时留空即可。
+socket: ""
+
+# 后端：nftables（生产）| mock（离线演示与单测）
+backend: nftables
+
+# nft 表名与地址族。inet 同时覆盖 IPv4/IPv6。
+table: fw
+family: inet
+
+# 运行时数据目录（快照、审计，后续里程碑使用）
+data_dir: /var/lib/fwdd
+
+# 声明式策略基线。启动时会加载为期望状态并下发。
+policy_file: /etc/fwdd/policy.yaml
+
+# API 令牌。非回环监听时必填；Linux 上建议 0600 存放于 /etc/fwdd/token。
+token: ""
+
+log_level: info
+
+# 危险变更兜底：开启后 apply 需在窗口内 confirm，否则自动回滚。
+# 强烈建议在远程运维的机器上开启。
+#
+# 例外：启动时从 policy_file 恢复不受此约束 —— 本地策略文件是可信基线，
+# 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+commit_confirm:
+  enabled: false
+  timeout: 60s
