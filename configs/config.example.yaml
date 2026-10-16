@@ -34,6 +34,26 @@ token: ""
 
 log_level: info
 
+# 内核网络参数管理。
+#
+# 设为 true 时，启动会写入下面 sysctls 的参数；设为 false（默认）时只读取检查，
+# 发现不一致就告警，不擅自改动内核。
+#
+# 为什么值得关注：网关型防火墙依赖 net.ipv4.ip_forward=1。这个开关没打开时，
+# 规则集看起来完全正确、nft 也正常加载，但跨网段流量根本不会到达 forward 钩子 ——
+# 表现为"策略写了却不生效"，而且极难排查。
+manage_sysctls: false
+
+# 留空则使用网关推荐基线：
+#   net.ipv4.ip_forward = 1       转发开关（网关的绝对前提）
+#   net.ipv4.tcp_syncookies = 1   抗 SYN 洪泛
+#   net.ipv4.conf.all.rp_filter = 0   多宿主/非对称路由场景下避免误丢包
+sysctls: []
+#  sysctls:
+#    - {key: net.ipv4.ip_forward, value: "1"}
+#    - {key: net.ipv4.tcp_syncookies, value: "1"}
+#    - {key: net.ipv4.conf.all.rp_filter, value: "0"}
+
 # 危险变更兜底：开启后 apply 需在窗口内 confirm，否则自动回滚。
 # 强烈建议在远程运维的机器上开启。
 #

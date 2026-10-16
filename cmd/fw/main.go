@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -20,6 +21,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
+	"fwdd/internal/netcfg"
 	"fwdd/internal/store"
 	"gopkg.in/yaml.v3"
 )
@@ -42,11 +44,30 @@ const usage = `fw —— 服务器网关防火墙命令行
                                    用文件替换期望状态
 
   fw zone list                     列出安全域
-  fw rule list [--json]            列出规则
+  fw zone add <名> [--iface eth0,eth1] [--net 10.0.0.0/8] [--trust lan]
+  fw zone rm <名>
+
+  fw rule list                     列出规则
+  fw rule add --src-zone lan --dst-zone wan --proto tcp --dport 443 \
+              --state new --action accept [--priority 100] [--log] [--comment 备注]
+  fw rule rm <id> | fw rule enable <id> | fw rule disable <id>
+  fw rule move <id> [--before <id>]
+
+  fw nat list                      列出 NAT 规则
+  fw nat add-dnat --proto tcp --match-port 8080 --to-addr 192.168.20.10 --to-port 80
+  fw nat add-snat --to-addr 203.0.113.1 --out-zone wan
+  fw nat add-masq --out-zone wan
+  fw nat rm <id>
 
   fw ban add <ip> [--ttl 秒] [--reason 文本]
   fw ban list
   fw ban rm <ip>
+
+  fw net                           查看网络状态（接口/地址/路由/转发开关）
+  fw net sysctl show               查看内核网络参数
+  fw net sysctl apply [--dry-run]  按基线写入内核参数（仅 Linux，需 root）
+
+注意：zone/rule/nat 的改动只写入期望状态，需要 fw apply 才下发到内核。
 
 全局参数:
   -config 路径   配置文件（默认 /etc/fwdd/config.yaml 或 $FWDD_CONFIG）
@@ -128,6 +149,10 @@ func run(args []string, out *os.File) error {
 		return cmdZone(ctx, c, out, format, sub)
 	case "rule":
 		return cmdRule(ctx, c, out, format, sub)
+	case "nat":
+		return cmdNAT(ctx, c, out, format, sub)
+	case "net":
+		return cmdNet(ctx, c, out, format, sub)
 	case "ban":
 		return cmdBan(ctx, c, out, format, sub)
 	default:
@@ -388,48 +413,508 @@ func cmdPolicy(ctx context.Context, c *client.Client, out *os.File, format strin
 }
 
 func cmdZone(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
-	if len(args) > 0 && args[0] != "list" {
-		return fmt.Errorf("目前仅支持 fw zone list")
+	if len(args) == 0 {
+		args = []string{"list"}
 	}
-	var resp struct {
-		Zones []model.Zone `json:"zones"`
+	switch args[0] {
+	case "list", "ls":
+		var resp struct {
+			Zones []model.Zone `json:"zones"`
+		}
+		if err := c.Get(ctx, "/zones", &resp); err != nil {
+			return err
+		}
+		if format == "json" {
+			return printJSON(out, resp.Zones)
+		}
+		if len(resp.Zones) == 0 {
+			fmt.Fprintln(out, "（暂无安全域）")
+			return nil
+		}
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "域\t信任\t接口\t网段")
+		for _, z := range resp.Zones {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", z.Name, orDash(string(z.Trust)),
+				orDash(strings.Join(z.Interfaces, ",")), orDash(strings.Join(z.Networks, ",")))
+		}
+		return w.Flush()
+
+	case "add":
+		fs := flag.NewFlagSet("zone add", flag.ContinueOnError)
+		ifaces := fs.String("iface", "", "接口列表，逗号分隔（如 eth0,eth1.10）")
+		nets := fs.String("net", "", "网段列表，逗号分隔（如 10.0.0.0/8）")
+		trust := fs.String("trust", "lan", "信任级别：untrusted|dmz|lan|local")
+		comment := fs.String("comment", "", "备注")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(pos) == 0 {
+			return errors.New("用法: fw zone add <域名> [--iface eth0,eth1] [--net 10.0.0.0/8] [--trust lan]")
+		}
+		z := model.Zone{
+			Name:       pos[0],
+			Interfaces: splitList(*ifaces),
+			Networks:   splitList(*nets),
+			Trust:      model.Trust(*trust),
+			Comment:    *comment,
+		}
+		var resp map[string]any
+		if err := c.Post(ctx, "/zones", z, &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, "已创建域 "+z.Name)
+
+	case "rm", "del", "remove":
+		if len(args) < 2 {
+			return errors.New("用法: fw zone rm <域名>")
+		}
+		var resp map[string]any
+		if err := c.Delete(ctx, "/zones/"+args[1], &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, "已删除域 "+args[1])
+
+	default:
+		return fmt.Errorf("未知子命令 fw zone %s（支持 list|add|rm）", args[0])
 	}
-	if err := c.Get(ctx, "/zones", &resp); err != nil {
-		return err
-	}
-	if format == "json" {
-		return printJSON(out, resp.Zones)
-	}
-	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "域\t信任\t接口\t网段")
-	for _, z := range resp.Zones {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", z.Name, orDash(string(z.Trust)),
-			orDash(strings.Join(z.Interfaces, ",")), orDash(strings.Join(z.Networks, ",")))
-	}
-	return w.Flush()
+}
+
+// pendingApply 打印成功信息并提醒还需要 apply 才生效。
+func pendingApply(out *os.File, msg string) error {
+	fmt.Fprintf(out, "%s（已写入期望状态，执行 fw apply 后生效）\n", msg)
+	return nil
 }
 
 func cmdRule(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
-	if len(args) > 0 && args[0] != "list" {
-		return fmt.Errorf("目前仅支持 fw rule list")
+	if len(args) == 0 {
+		args = []string{"list"}
 	}
+	switch args[0] {
+	case "list", "ls":
+		var resp struct {
+			Rules []model.Rule `json:"rules"`
+		}
+		if err := c.Get(ctx, "/rules", &resp); err != nil {
+			return err
+		}
+		if format == "json" {
+			return printJSON(out, resp.Rules)
+		}
+		if len(resp.Rules) == 0 {
+			fmt.Fprintln(out, "（暂无规则）")
+			return nil
+		}
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\t优先级\t源域\t目的域\t协议\t端口\t动作\t启用")
+		for _, r := range resp.Rules {
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				r.ID, r.Priority, orAny(r.SrcZone), orAny(r.DstZone), orAny(string(r.Proto)),
+				orDash(strings.Join(r.DstPort, ",")), r.Action, yesNo(r.IsEnabled()))
+		}
+		return w.Flush()
+
+	case "add":
+		r, err := parseRuleFlags(args[1:])
+		if err != nil {
+			return err
+		}
+		var resp struct {
+			ID string `json:"id"`
+		}
+		if err := c.Post(ctx, "/rules", r, &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, "已添加规则 "+resp.ID)
+
+	case "rm", "del", "remove":
+		if len(args) < 2 {
+			return errors.New("用法: fw rule rm <id>")
+		}
+		var resp map[string]any
+		if err := c.Delete(ctx, "/rules/"+args[1], &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, "已删除规则 "+args[1])
+
+	case "enable", "disable":
+		if len(args) < 2 {
+			return fmt.Errorf("用法: fw rule %s <id>", args[0])
+		}
+		on := args[0] == "enable"
+		var resp map[string]any
+		path := client.Query("/rules/"+args[1]+"/enable", map[string]string{"enabled": strconv.FormatBool(on)})
+		if err := c.Post(ctx, path, nil, &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, fmt.Sprintf("规则 %s 已%s", args[1], map[bool]string{true: "启用", false: "停用"}[on]))
+
+	case "move":
+		fs := flag.NewFlagSet("rule move", flag.ContinueOnError)
+		before := fs.String("before", "", "移到该规则之前；留空表示移到末尾")
+		pos, err := parseInterspersed(fs, args[1:])
+		if err != nil {
+			return err
+		}
+		if len(pos) == 0 {
+			return errors.New("用法: fw rule move <id> [--before <id>]")
+		}
+		var resp map[string]any
+		if err := c.Post(ctx, "/rules/"+pos[0]+"/move", map[string]string{"before": *before}, &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, "已移动规则 "+pos[0])
+
+	default:
+		return fmt.Errorf("未知子命令 fw rule %s（支持 list|add|rm|enable|disable|move）", args[0])
+	}
+}
+
+// parseRuleFlags 把命令行开关转成一条规则。
+func parseRuleFlags(args []string) (model.Rule, error) {
+	var r model.Rule
+	fs := flag.NewFlagSet("rule add", flag.ContinueOnError)
+	fs.StringVar(&r.ID, "id", "", "规则 id（留空自动生成）")
+	fs.IntVar(&r.Priority, "priority", 0, "优先级，小的先匹配（留空排到末尾）")
+	fs.StringVar(&r.SrcZone, "src-zone", model.ZoneAny, "源域")
+	fs.StringVar(&r.DstZone, "dst-zone", model.ZoneAny, "目的域（local 表示本机）")
+	proto := fs.String("proto", "", "协议：tcp|udp|icmp|icmpv6|any")
+	srcAddr := fs.String("src", "", "源地址列表，逗号分隔")
+	dstAddr := fs.String("dst", "", "目的地址列表，逗号分隔")
+	sport := fs.String("sport", "", "源端口列表，逗号分隔")
+	dport := fs.String("dport", "", "目的端口列表，可为区间如 1000-2000")
+	state := fs.String("state", "", "conntrack 状态列表：new,established,related,invalid")
+	action := fs.String("action", "", "动作：accept|drop|reject|log")
+	reject := fs.String("reject", "", "reject 方式：tcp-reset|icmp-port-unreachable")
+	rate := fs.Int("limit-rate", 0, "限速：单位时间内的包数")
+	per := fs.String("limit-per", "second", "限速单位：second|minute|hour|day")
+	burst := fs.Int("limit-burst", 0, "限速突发额度")
+	perIP := fs.Bool("limit-per-ip", false, "限速是否按源地址分别计数")
+	logIt := fs.Bool("log", false, "命中时记录日志")
+	comment := fs.String("comment", "", "备注")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return r, err
+	}
+	if *action == "" {
+		return r, errors.New("必须用 --action 指定动作（accept|drop|reject|log）")
+	}
+	if r.SrcZone == "" {
+		r.SrcZone = model.ZoneAny
+	}
+	if r.DstZone == "" {
+		r.DstZone = model.ZoneAny
+	}
+	r.Proto = model.Proto(*proto)
+	if r.Proto == "" {
+		r.Proto = model.ProtoAny
+	}
+	r.SrcAddr = splitList(*srcAddr)
+	r.DstAddr = splitList(*dstAddr)
+	r.SrcPort = splitList(*sport)
+	r.DstPort = splitList(*dport)
+	r.State = splitList(*state)
+	r.Action = model.Action(*action)
+	r.Reject = model.RejectMode(*reject)
+	r.Log = *logIt
+	r.Comment = *comment
+	if *rate > 0 {
+		r.Limit = &model.RateLimit{Rate: *rate, Per: *per, Burst: *burst, PerIP: *perIP}
+	}
+	return r, nil
+}
+
+func cmdNAT(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+	switch args[0] {
+	case "list", "ls":
+		var resp struct {
+			Rules []model.NATRule `json:"nat_rules"`
+		}
+		if err := c.Get(ctx, "/nat", &resp); err != nil {
+			return err
+		}
+		if format == "json" {
+			return printJSON(out, resp.Rules)
+		}
+		if len(resp.Rules) == 0 {
+			fmt.Fprintln(out, "（暂无 NAT 规则）")
+			return nil
+		}
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "ID\t优先级\t类型\t协议\t匹配\t转换\t启用")
+		for _, n := range resp.Rules {
+			match := strings.Join(n.MatchAddr, ",")
+			if n.MatchPort != "" {
+				match = strings.TrimSuffix(match, ",") + ":" + n.MatchPort
+			}
+			to := n.ToAddr
+			if n.ToPort != "" {
+				to += ":" + n.ToPort
+			}
+			if n.Kind == model.NATMasquerade {
+				to = "出接口地址"
+			}
+			fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\t%s\n",
+				n.ID, n.Priority, n.Kind, orAny(string(n.Proto)), orDash(match), orDash(to), yesNo(n.IsEnabled()))
+		}
+		return w.Flush()
+
+	case "add-dnat", "add-snat", "add-masq", "add-masquerade":
+		n, err := parseNATFlags(args[0], args[1:])
+		if err != nil {
+			return err
+		}
+		var resp struct {
+			ID string `json:"id"`
+		}
+		if err := c.Post(ctx, "/nat", n, &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, fmt.Sprintf("已添加 %s 规则 %s", n.Kind, resp.ID))
+
+	case "rm", "del", "remove":
+		if len(args) < 2 {
+			return errors.New("用法: fw nat rm <id>")
+		}
+		var resp map[string]any
+		if err := c.Delete(ctx, "/nat/"+args[1], &resp); err != nil {
+			return err
+		}
+		return pendingApply(out, "已删除 NAT 规则 "+args[1])
+
+	default:
+		return fmt.Errorf("未知子命令 fw nat %s（支持 list|add-dnat|add-snat|add-masq|rm）", args[0])
+	}
+}
+
+// parseNATFlags 把命令行开关转成一条 NAT 规则。
+func parseNATFlags(sub string, args []string) (model.NATRule, error) {
+	var n model.NATRule
+	fs := flag.NewFlagSet("nat", flag.ContinueOnError)
+	fs.StringVar(&n.ID, "id", "", "规则 id（留空自动生成）")
+	fs.IntVar(&n.Priority, "priority", 0, "优先级（留空排到末尾）")
+	proto := fs.String("proto", "", "协议：tcp|udp")
+	fs.StringVar(&n.SrcZone, "src-zone", "", "匹配来源域")
+	src := fs.String("src", "", "匹配源地址列表，逗号分隔")
+	match := fs.String("match-addr", "", "被转换的目的地址列表（dnat 用）")
+	fs.StringVar(&n.MatchPort, "match-port", "", "匹配的目的端口（dnat 用）")
+	fs.StringVar(&n.ToAddr, "to-addr", "", "转换后的地址")
+	fs.StringVar(&n.ToPort, "to-port", "", "转换后的端口")
+	fs.StringVar(&n.OutZone, "out-zone", "", "出接口域（snat/masquerade 用）")
+	fs.StringVar(&n.Comment, "comment", "", "备注")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return n, err
+	}
+
+	switch sub {
+	case "add-dnat":
+		n.Kind = model.NATDNAT
+	case "add-snat":
+		n.Kind = model.NATSNAT
+	default:
+		n.Kind = model.NATMasquerade
+	}
+	n.Proto = model.Proto(*proto)
+	if n.Proto == "" {
+		n.Proto = model.ProtoAny
+	}
+	n.SrcAddr = splitList(*src)
+	n.MatchAddr = splitList(*match)
+
+	// 在这里先做一次基本检查，让错误在本地就暴露，不必等 API 往返。
+	switch n.Kind {
+	case model.NATDNAT:
+		if n.ToAddr == "" {
+			return n, errors.New("dnat 必须用 --to-addr 指定转换后的地址")
+		}
+	case model.NATSNAT:
+		if n.ToAddr == "" {
+			return n, errors.New("snat 必须用 --to-addr 指定转换后的地址")
+		}
+	case model.NATMasquerade:
+		if n.OutZone == "" {
+			return n, errors.New("masquerade 必须用 --out-zone 指定出接口所属的域")
+		}
+	}
+	return n, nil
+}
+
+func cmdNet(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	if len(args) > 0 && args[0] == "sysctl" {
+		return cmdNetSysctl(ctx, c, out, format, args[1:])
+	}
+	if len(args) > 0 && args[0] != "list" && args[0] != "show" {
+		return fmt.Errorf("未知子命令 fw net %s（支持 list|sysctl）", args[0])
+	}
+
 	var resp struct {
-		Rules []model.Rule `json:"rules"`
+		State struct {
+			Platform   string             `json:"platform"`
+			Sysctls    map[string]string  `json:"sysctls"`
+			Links      []netcfg.LinkState `json:"links"`
+			Addresses  []netcfg.Address   `json:"addresses"`
+			Routes     []netcfg.Route     `json:"routes"`
+			IPRules    []netcfg.IPRule    `json:"ip_rules"`
+			Forwarding bool               `json:"forwarding"`
+			Note       string             `json:"note"`
+		} `json:"state"`
+		Supported  bool            `json:"supported"`
+		Diff       []netcfg.Change `json:"sysctl_diff"`
+		Forwarding bool            `json:"forwarding_ok"`
 	}
-	if err := c.Get(ctx, "/rules", &resp); err != nil {
+	if err := c.Get(ctx, "/net", &resp); err != nil {
 		return err
 	}
 	if format == "json" {
-		return printJSON(out, resp.Rules)
+		return printJSON(out, resp)
 	}
-	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\t优先级\t源域\t目的域\t协议\t端口\t动作\t启用")
-	for _, r := range resp.Rules {
-		fmt.Fprintf(w, "%s\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			r.ID, r.Priority, orAny(r.SrcZone), orAny(r.DstZone), orAny(string(r.Proto)),
-			orDash(strings.Join(r.DstPort, ",")), r.Action, yesNo(r.IsEnabled()))
+
+	st := resp.State
+	fmt.Fprintf(out, "平台: %s（可管理内核参数: %s）\n", st.Platform, yesNo(resp.Supported))
+	if st.Note != "" {
+		fmt.Fprintf(out, "说明: %s\n", st.Note)
 	}
-	return w.Flush()
+	switch {
+	case resp.Supported && st.Forwarding:
+		fmt.Fprintln(out, "IPv4 转发: 已开启")
+	case resp.Supported:
+		fmt.Fprintln(out, "IPv4 转发: ❌ 未开启 —— 跨网段流量不会经过 forward 钩子，防火墙策略对它不生效")
+		fmt.Fprintln(out, "           修复: sysctl -w net.ipv4.ip_forward=1，或设置 manage_sysctls: true")
+	default:
+		// 非 Linux 平台没有这个开关，不做判定，免得误报。
+		fmt.Fprintln(out, "IPv4 转发: 不适用（该平台无此内核开关）")
+	}
+
+	if resp.Supported && len(resp.Diff) > 0 {
+		fmt.Fprintln(out, "\n与推荐基线不一致的内核参数:")
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  参数\t当前\t建议")
+		for _, c := range resp.Diff {
+			fmt.Fprintf(w, "  %s\t%s\t%s\n", c.Target, orDash(c.From), c.To)
+		}
+		_ = w.Flush()
+	}
+
+	if len(st.Links) > 0 {
+		fmt.Fprintln(out, "\n接口:")
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  名称\tMTU\t状态\t标志")
+		for _, l := range st.Links {
+			status := "down"
+			if l.Up {
+				status = "up"
+			}
+			fmt.Fprintf(w, "  %s\t%d\t%s\t%s\n", l.Name, l.MTU, status, orDash(strings.Join(l.Flags, ",")))
+		}
+		_ = w.Flush()
+	}
+
+	if len(st.Addresses) > 0 {
+		fmt.Fprintln(out, "\n地址:")
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		for _, a := range st.Addresses {
+			fmt.Fprintf(w, "  %s\t%s\n", orDash(a.Interface), a.CIDR)
+		}
+		_ = w.Flush()
+	}
+
+	if len(st.Routes) > 0 {
+		fmt.Fprintln(out, "\n路由:")
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  目的\t网关\t接口\t度量")
+		for _, r := range st.Routes {
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%d\n", r.Dst, orDash(r.Via), orDash(r.Dev), r.Metric)
+		}
+		_ = w.Flush()
+	}
+
+	if len(st.IPRules) > 0 {
+		fmt.Fprintln(out, "\n策略路由规则:")
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  优先级\t来源\t目的\t表")
+		for _, r := range st.IPRules {
+			fmt.Fprintf(w, "  %d\t%s\t%s\t%d\n", r.Priority, orDash(r.From), orDash(r.To), r.Table)
+		}
+		_ = w.Flush()
+	}
+	return nil
+}
+
+func cmdNetSysctl(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	sub := "show"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "show", "list":
+		var resp struct {
+			State struct {
+				Sysctls map[string]string `json:"sysctls"`
+			} `json:"state"`
+			Diff []netcfg.Change `json:"sysctl_diff"`
+		}
+		if err := c.Get(ctx, "/net", &resp); err != nil {
+			return err
+		}
+		if format == "json" {
+			return printJSON(out, resp)
+		}
+		w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "参数\t当前值\t建议值")
+		advice := map[string]string{}
+		for _, c := range resp.Diff {
+			advice[c.Target] = c.To
+		}
+		for _, k := range sortedKeys(resp.State.Sysctls) {
+			fmt.Fprintf(w, "%s\t%s\t%s\n", k, resp.State.Sysctls[k], orDash(advice[k]))
+		}
+		return w.Flush()
+
+	case "apply":
+		fs := flag.NewFlagSet("net sysctl apply", flag.ContinueOnError)
+		dryRun := fs.Bool("dry-run", false, "只显示将要做的变更")
+		if _, err := parseInterspersed(fs, args[1:]); err != nil {
+			return err
+		}
+		var resp struct {
+			Applied []netcfg.Change `json:"applied"`
+			Changes []netcfg.Change `json:"changes"`
+			DryRun  bool            `json:"dry_run"`
+			Count   int             `json:"count"`
+			Error   string          `json:"error"`
+		}
+		body := map[string]any{"dry_run": *dryRun}
+		if err := c.Post(ctx, "/net/sysctls", body, &resp); err != nil {
+			return err
+		}
+		if resp.Error != "" {
+			return errors.New(resp.Error)
+		}
+		if *dryRun {
+			if len(resp.Changes) == 0 {
+				fmt.Fprintln(out, "内核参数已符合基线，无需变更")
+				return nil
+			}
+			fmt.Fprintln(out, "将执行以下变更（未实际修改）:")
+			for _, ch := range resp.Changes {
+				fmt.Fprintf(out, "  %s\n", ch)
+			}
+			return nil
+		}
+		if len(resp.Applied) == 0 {
+			fmt.Fprintln(out, "内核参数已符合基线，未做修改")
+			return nil
+		}
+		for _, ch := range resp.Applied {
+			fmt.Fprintf(out, "已设置 %s: %s -> %s\n", ch.Target, orDash(ch.From), ch.To)
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("未知子命令 fw net sysctl %s（支持 show|apply）", sub)
+	}
 }
 
 func cmdBan(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
@@ -549,6 +1034,17 @@ func yesNo(b bool) string {
 	return "否"
 }
 
+// splitList 把逗号分隔的列表拆成切片，忽略空白项。
+func splitList(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func orDash(s string) string {
 	if s == "" {
 		return "-"
@@ -595,4 +1091,14 @@ func defaultConfigPath() string {
 		return filepath.Join(v, "fwdd", "config.yaml")
 	}
 	return "/etc/fwdd/config.yaml"
+}
+
+// sortedKeys 返回排序后的键，让输出稳定可 diff。
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

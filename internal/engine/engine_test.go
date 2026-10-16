@@ -555,3 +555,8 @@ func TestConfigEnabledConfirmStillApplies(t *testing.T) {
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+// newMockBackend 供 CRUD 测试复用。
+func newMockBackend() *mock.Backend {
+	return mock.New(mock.WithTableName("fw"))
+}

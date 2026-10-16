@@ -24,6 +24,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
+	"fwdd/internal/netcfg"
 	"fwdd/internal/store"
 	"gopkg.in/yaml.v3"
 )
@@ -158,16 +159,72 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 网络配置检查：这是网关防火墙最容易踩的坑 —— 转发没打开时，
+	// 规则集看起来完全正确，nft 也加载成功，但跨网段流量根本不会
+	// 到达 filter 钩子，表现为"策略写了却不生效"。
+	netProvider := netcfg.New()
+	checkNetworking(ctx, netProvider, cfg, logger)
+
 	// 后台维护：定期清理已过期的封禁记录。
 	eng.StartMaintenance(ctx)
 
-	srv := api.New(cfg, eng, logger)
+	srv := api.New(cfg, eng, netProvider, logger)
 	logger.Info("fwdd 启动完成", "backend", be.Name())
 	if err := srv.Serve(ctx); err != nil {
 		return err
 	}
 	logger.Info("fwdd 已退出")
 	return nil
+}
+
+// checkNetworking 检查（可选地管理）内核网络参数。
+//
+// 默认只检查并告警，不擅自改动内核 —— 悄悄打开转发开关这种事，
+// 应该由管理员显式配置 manage_sysctls: true 决定。
+func checkNetworking(ctx context.Context, np netcfg.Provider, cfg config.Config, logger *slog.Logger) {
+	st, err := np.Read(ctx)
+	if err != nil {
+		logger.Warn("读取网络状态失败，跳过转发检查", "err", err)
+		return
+	}
+	if !np.Supported() {
+		logger.Info("当前平台不支持管理内核网络参数，跳过转发检查", "platform", np.Platform())
+		return
+	}
+
+	baseline, err := netcfg.Normalize(cfg.SysctlBaseline())
+	if err != nil {
+		logger.Error("内核参数配置非法", "err", err)
+		return
+	}
+
+	if cfg.ManageSysctls {
+		applied, err := np.SetSysctls(ctx, baseline)
+		if err != nil {
+			logger.Error("写入内核网络参数失败", "err", err, "applied", len(applied))
+			// 继续启动：网络参数写入失败不应阻止防火墙本身工作。
+		} else if len(applied) == 0 {
+			logger.Info("内核网络参数已符合基线，无需变更")
+		} else {
+			for _, c := range applied {
+				logger.Info("已设置内核参数", "key", c.Target, "from", c.From, "to", c.To)
+			}
+		}
+	}
+
+	// 无论是否管理，都要重新读一次并检查转发状态。
+	if st, err = np.Read(ctx); err != nil {
+		return
+	}
+	if !st.Forwarding {
+		logger.Warn("⚠ IPv4 转发未开启：跨网段流量不会经过 forward 钩子，防火墙策略对它完全不生效",
+			"修复", "sysctl -w net.ipv4.ip_forward=1，或在配置中设置 manage_sysctls: true")
+	}
+	for _, c := range netcfg.DiffSysctls(baseline, st.Sysctls) {
+		logger.Info("内核参数与基线不一致（未自动修改）",
+			"key", c.Target, "current", c.From, "expected", c.To,
+			"提示", "设置 manage_sysctls: true 可让 fwdd 自动管理")
+	}
 }
 
 func buildBackend(cfg config.Config, logger *slog.Logger) (backend.Backend, error) {

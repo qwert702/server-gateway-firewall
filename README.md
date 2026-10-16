@@ -12,7 +12,7 @@
 
 ## 当前进度
 
-本项目按里程碑推进，**M1 + M2 + M3 已完成**（见下方「路线图」）：
+本项目按里程碑推进，**M1 + M2 + M3 已完成，M4 进行中**（见下方「路线图」）：
 
 | 能力 | 状态 |
 | --- | --- |
@@ -23,7 +23,11 @@
 | `fw` CLI / REST API / commit-confirm 自动回滚 / dry-run | ✅ |
 | YAML 配置与策略基线 | ✅ |
 | SQLite 持久化、重启恢复、审计日志 | ✅ |
-| NAT 网络配置、自动封禁引擎、GeoIP、Web UI | ⏳ M4–M7 |
+| 规则 / 域 / NAT 的 CLI 与 REST CRUD | ✅ |
+| 转发开关等内核网络参数管理与检查 | ✅ |
+| 网络状态清点（接口 / 地址 / 路由 / 策略路由） | ✅ |
+| 接口与路由的**写入**（最易自锁，需 commit-confirm 兜底） | ⏳ |
+| 自动封禁引擎、GeoIP、Web UI | ⏳ M5–M7 |
 
 > 驱动真实 `nft` 的测试在无 nft 或非 root 环境下自动跳过，因此 `go test ./...`
 > 在 Windows/macOS 上也能跑；生成的规则集**尚未在真机校验过语法**，
@@ -123,6 +127,27 @@ sudo ./bin/fwdd -config /etc/fwdd/config.yaml -import-policy
 
 启动时的下发**不进入 commit-confirm 窗口**：本地策略文件是可信基线，
 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+
+---
+
+## 网络前提：转发开关
+
+网关型防火墙依赖 `net.ipv4.ip_forward=1`。**这个开关没打开时，规则集看起来完全
+正确、`nft` 也正常加载、所有校验都过，但跨网段流量根本不会到达 `forward` 钩子** ——
+表现为"策略写了却不生效"，而且排查方向很容易跑偏。
+
+所以 fwdd 启动时会检查它：
+
+```bash
+fw net                      # 网络状态；转发未开启时明确点出来
+fw net sysctl show          # 内核参数当前值 vs 建议值
+sudo fw net sysctl apply --dry-run   # 先看要改什么
+sudo fw net sysctl apply             # 按基线写入
+```
+
+默认**只检查告警、不擅自改内核**。要让 fwdd 在启动时自动管理，在配置里打开
+`manage_sysctls: true`，并可用 `sysctls:` 覆盖默认基线（默认基线为
+`ip_forward=1`、`tcp_syncookies=1`、`rp_filter=0`）。
 
 ---
 
@@ -241,6 +266,8 @@ fw ruleset                           打印完整 nft 规则集
 fw apply [--dry-run] [--confirm] [--timeout 秒]
 fw confirm / fw rollback / fw revisions
 fw audit [-n 条数]                    操作审计日志
+fw net                               网络状态：接口/地址/路由/转发开关
+fw net sysctl show|apply [--dry-run]  查看 / 按基线写入内核网络参数
 fw policy get|set -f 文件 [--apply]
 fw zone list / fw rule list
 fw ban add <ip> [--ttl 秒] [--reason 文本] | fw ban list | fw ban rm <ip>
@@ -266,6 +293,9 @@ fw ban add <ip> [--ttl 秒] [--reason 文本] | fw ban list | fw ban rm <ip>
 | POST | `/confirm` `/rollback` | 确认 / 回滚 |
 | GET | `/revisions` | 下发历史 |
 | GET | `/audit` | 操作审计日志（`?limit=`） |
+| GET | `/net` | 网络状态与内核参数差异 |
+| POST | `/net/sysctls` | 写入内核网络参数（`?dry_run`） |
+| POST/PUT/DELETE | `/zones` `/rules` `/nat` | 策略对象增删改 |
 | GET/POST | `/bans`，DELETE `/bans/{ip}` | 封禁管理 |
 | GET | `/zones` `/rules` `/config` | 策略与配置查询 |
 
@@ -298,6 +328,7 @@ internal/engine/     期望/已应用状态机、commit-confirm、回滚、封�
 internal/api/        REST 接口与认证
 internal/client/     CLI 用的 API 客户端（Unix 套接字优先）
 internal/store/      SQLite 持久化（策略、封禁、审计、元数据）
+internal/netcfg/     内核网络参数与接口/路由清点（Linux 实现 + 其他平台桩）
 internal/config/     守护进程配置加载与校验
 configs/             配置与策略示例
 deploy/              验证脚本与 systemd 单元（M7 完善）
@@ -329,7 +360,9 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 - **M1 + M2（已完成）** 骨架、后端抽象、模型、编译器、原子下发、dry-run、
   commit-confirm、CLI 与 REST API。
 - **M3（已完成）** SQLite 持久化与重启恢复、审计日志、过期封禁清理。
-- **M4** NAT 完整落地；用 netlink 配置接口/地址/路由/`ip rule`/转发 sysctl。
+- **M4（进行中）** 策略对象 CRUD；转发开关等内核网络参数的管理与检查；
+  接口/地址/路由/策略路由的只读清点。接口与路由的**写入**尚未实现 ——
+  这是最容易把自己锁死的操作，需要先把它接进 commit-confirm 兜底。
 - **M5** 限速与自动封禁引擎（conntrack 探测、日志解析、递增惩罚、白名单豁免）。
 - **M6** 认证与审计完善、Prometheus 指标、SSE 实时连接与日志、内嵌 Web UI。
 - **M7** GeoIP 国家拦截、大集合性能优化、systemd 打包、netns 端到端测试矩阵。
@@ -338,6 +371,7 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 
 ## 已知限制
 
-- 尚未接管接口/路由配置，只负责过滤与 NAT 规则本身。
+- 网络配置目前只读：可以清点接口/地址/路由，可以管理内核参数，
+  但**不能**写入接口地址或路由条目。
 - 未与既有 iptables 规则做共存策略；同一钩子上二者会按 priority 排序，接管前请确认。
 - GeoIP、连接数统计、日志流等读取类接口尚未实现。

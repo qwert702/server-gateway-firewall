@@ -18,6 +18,7 @@ import (
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
+	"fwdd/internal/netcfg"
 	"fwdd/internal/store"
 )
 
@@ -25,17 +26,21 @@ import (
 type Server struct {
 	cfg    config.Config
 	engine *engine.Engine
+	net    netcfg.Provider
 	log    *slog.Logger
 	mux    *http.ServeMux
 	start  time.Time
 }
 
 // New 构造 API 服务。
-func New(cfg config.Config, e *engine.Engine, log *slog.Logger) *Server {
+func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	s := &Server{cfg: cfg, engine: e, log: log, mux: http.NewServeMux(), start: time.Now()}
+	if net == nil {
+		net = netcfg.New()
+	}
+	s := &Server{cfg: cfg, engine: e, net: net, log: log, mux: http.NewServeMux(), start: time.Now()}
 	s.routes()
 	return s
 }
@@ -62,8 +67,27 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/bans", s.handleAddBan)
 	s.mux.HandleFunc("DELETE "+p+"/bans/{ip}", s.handleDeleteBan)
 	s.mux.HandleFunc("GET "+p+"/zones", s.handleListZones)
+	s.mux.HandleFunc("POST "+p+"/zones", s.handleAddZone)
+	s.mux.HandleFunc("PUT "+p+"/zones/{name}", s.handleUpdateZone)
+	s.mux.HandleFunc("DELETE "+p+"/zones/{name}", s.handleDeleteZone)
+
 	s.mux.HandleFunc("GET "+p+"/rules", s.handleListRules)
+	s.mux.HandleFunc("POST "+p+"/rules", s.handleAddRule)
+	s.mux.HandleFunc("PUT "+p+"/rules/{id}", s.handleUpdateRule)
+	s.mux.HandleFunc("DELETE "+p+"/rules/{id}", s.handleDeleteRule)
+	s.mux.HandleFunc("POST "+p+"/rules/{id}/enable", s.handleEnableRule)
+	s.mux.HandleFunc("POST "+p+"/rules/{id}/move", s.handleMoveRule)
+	s.mux.HandleFunc("POST "+p+"/rules/order", s.handleReorderRules)
+
+	s.mux.HandleFunc("GET "+p+"/nat", s.handleListNAT)
+	s.mux.HandleFunc("POST "+p+"/nat", s.handleAddNAT)
+	s.mux.HandleFunc("PUT "+p+"/nat/{id}", s.handleUpdateNAT)
+	s.mux.HandleFunc("DELETE "+p+"/nat/{id}", s.handleDeleteNAT)
+
 	s.mux.HandleFunc("GET "+p+"/config", s.handleGetConfig)
+
+	s.mux.HandleFunc("GET "+p+"/net", s.handleNetState)
+	s.mux.HandleFunc("POST "+p+"/net/sysctls", s.handleSetSysctls)
 	s.mux.HandleFunc("/", s.handleNotFound)
 }
 
@@ -321,12 +345,237 @@ func (s *Server) handleListZones(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListRules(w http.ResponseWriter, r *http.Request) {
-	p := s.engine.Policy()
-	rules := p.Rules
+	rules := s.engine.ListRules()
 	if rules == nil {
 		rules = []model.Rule{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"rules": rules, "count": len(rules)})
+}
+
+// ---- 域 CRUD ----
+
+func (s *Server) handleAddZone(w http.ResponseWriter, r *http.Request) {
+	var z model.Zone
+	if !decodeBody(w, r, &z) {
+		return
+	}
+	if err := s.engine.AddZone(z); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"created": z.Name})
+}
+
+func (s *Server) handleUpdateZone(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	var z model.Zone
+	if !decodeBody(w, r, &z) {
+		return
+	}
+	if err := s.engine.UpdateZone(name, z); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": name})
+}
+
+func (s *Server) handleDeleteZone(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := s.engine.DeleteZone(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": name})
+}
+
+// ---- 规则 CRUD ----
+
+func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
+	var rule model.Rule
+	if !decodeBody(w, r, &rule) {
+		return
+	}
+	id, err := s.engine.AddRule(rule)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var rule model.Rule
+	if !decodeBody(w, r, &rule) {
+		return
+	}
+	if err := s.engine.UpdateRule(id, rule); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": id})
+}
+
+func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.engine.DeleteRule(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func (s *Server) handleEnableRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.engine.SetRuleEnabled(id, boolParam(r, "enabled", true)); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "enabled": boolParam(r, "enabled", true)})
+}
+
+func (s *Server) handleMoveRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var req struct {
+		Before string `json:"before"`
+	}
+	if r.ContentLength > 0 {
+		if !decodeBody(w, r, &req) {
+			return
+		}
+	}
+	if err := s.engine.MoveRule(id, req.Before); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"moved": id, "before": req.Before})
+}
+
+func (s *Server) handleReorderRules(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	if err := s.engine.ReorderRules(req.IDs); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"reordered": len(req.IDs)})
+}
+
+// ---- NAT CRUD ----
+
+func (s *Server) handleListNAT(w http.ResponseWriter, r *http.Request) {
+	rules := s.engine.ListNATRules()
+	if rules == nil {
+		rules = []model.NATRule{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"nat_rules": rules, "count": len(rules)})
+}
+
+func (s *Server) handleAddNAT(w http.ResponseWriter, r *http.Request) {
+	var n model.NATRule
+	if !decodeBody(w, r, &n) {
+		return
+	}
+	id, err := s.engine.AddNATRule(n)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func (s *Server) handleUpdateNAT(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var n model.NATRule
+	if !decodeBody(w, r, &n) {
+		return
+	}
+	if err := s.engine.UpdateNATRule(id, n); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"updated": id})
+}
+
+func (s *Server) handleDeleteNAT(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.engine.DeleteNATRule(id); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": id})
+}
+
+func (s *Server) handleNetState(w http.ResponseWriter, r *http.Request) {
+	st, err := s.net.Read(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// 附上"期望值 vs 当前值"的差异，让调用方一眼看出转发是否已打开。
+	baseline := s.cfg.SysctlBaseline()
+	norm, err := netcfg.Normalize(baseline)
+	if err != nil {
+		norm = baseline
+	}
+	if st.Sysctls == nil {
+		st.Sysctls = map[string]string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"state":         st,
+		"supported":     s.net.Supported(),
+		"baseline":      norm,
+		"sysctl_diff":   netcfg.DiffSysctls(norm, st.Sysctls),
+		"forwarding_ok": st.Forwarding,
+	})
+}
+
+func (s *Server) handleSetSysctls(w http.ResponseWriter, r *http.Request) {
+	if !s.net.Supported() {
+		writeError(w, http.StatusNotImplemented,
+			"netcfg: 当前平台不支持写入内核网络参数（仅 Linux）")
+		return
+	}
+	var req struct {
+		Sysctls []netcfg.Sysctl `json:"sysctls"`
+		DryRun  bool            `json:"dry_run"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	list := req.Sysctls
+	if len(list) == 0 {
+		list = s.cfg.SysctlBaseline()
+	}
+	norm, err := netcfg.Normalize(list)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	st, err := s.net.Read(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	planned := netcfg.DiffSysctls(norm, st.Sysctls)
+	if req.DryRun || boolParam(r, "dry_run", false) {
+		writeJSON(w, http.StatusOK, map[string]any{"dry_run": true, "changes": planned})
+		return
+	}
+
+	applied, err := s.net.SetSysctls(r.Context(), norm)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": err.Error(), "applied": applied, "planned": planned,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"applied": applied, "count": len(applied)})
 }
 
 func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
@@ -408,6 +657,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+// decodeBody 解析 JSON 请求体；失败时已写出 400 响应，返回 false。
+func decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体不是合法 JSON: "+err.Error())
+		return false
+	}
+	return true
 }
 
 // writeValidationError 把校验失败映射为 400，其余映射为 500。

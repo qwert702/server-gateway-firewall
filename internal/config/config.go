@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"fwdd/internal/netcfg"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -48,6 +50,20 @@ type Config struct {
 
 	// CommitConfirm 控制危险变更的兜底回滚。
 	CommitConfirm CommitConfirm `yaml:"commit_confirm" json:"commit_confirm"`
+
+	// ManageSysctls 为 true 时，启动会写入 Sysctls 中的内核网络参数。
+	// 为 false（默认）时只读取检查并在缺失时告警，不擅自改动内核。
+	ManageSysctls bool `yaml:"manage_sysctls" json:"manage_sysctls"`
+	// Sysctls 为内核网络参数；为空时使用网关推荐基线。
+	Sysctls []netcfg.Sysctl `yaml:"sysctls" json:"sysctls,omitempty"`
+}
+
+// SysctlBaseline 返回本次启动应使用的内核参数基线。
+func (c *Config) SysctlBaseline() []netcfg.Sysctl {
+	if len(c.Sysctls) > 0 {
+		return c.Sysctls
+	}
+	return netcfg.GatewayBaseline()
 }
 
 // CommitConfirm 是 commit-confirm 的安全参数。
