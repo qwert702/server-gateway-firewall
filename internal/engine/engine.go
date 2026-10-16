@@ -445,6 +445,69 @@ type Plan struct {
 	Changed  bool          `json:"changed"`
 	Applied  string        `json:"applied_hash,omitempty"`
 	Diff     []ChainChange `json:"diff,omitempty"`
+	// ChainDetails 给出每条链逐条规则的裁决，供界面画出"规则指纹"。
+	ChainDetails []ChainDetail `json:"chain_details,omitempty"`
+}
+
+// ChainDetail 是一条链的逐条规则明细。
+type ChainDetail struct {
+	Name     string        `json:"name"`
+	Type     string        `json:"type"`
+	Hook     string        `json:"hook"`
+	Priority int           `json:"priority"`
+	Policy   string        `json:"policy,omitempty"`
+	Rules    int           `json:"rules"`
+	Segments []RuleSegment `json:"segments"`
+}
+
+// RuleSegment 是规则指纹里的一格：一条规则及其裁决。
+type RuleSegment struct {
+	ID      string `json:"id,omitempty"`
+	Verdict string `json:"verdict"`
+	Comment string `json:"comment,omitempty"`
+}
+
+// describeSegments 从编译产物中提取每条链的规则裁决序列。
+//
+// 取的是规则里最后一条裁决语句：一条规则可能先计数、再记录日志、最后才丢弃，
+// 真正决定去向的是末尾那条。
+func describeSegments(snap *ir.Snapshot) []ChainDetail {
+	if snap == nil {
+		return nil
+	}
+	var out []ChainDetail
+	for _, t := range snap.Tables {
+		for _, c := range t.Chains {
+			d := ChainDetail{
+				Name: c.Name, Type: string(c.Type), Hook: string(c.Hook),
+				Priority: c.Priority, Policy: c.Policy, Rules: len(c.Rules),
+			}
+			for _, r := range c.Rules {
+				seg := RuleSegment{ID: r.ID, Comment: r.Comment, Verdict: "other"}
+				// isLog 单独记：`log` 动作的规则**没有**裁决语句（它只记录、
+				// 不决定去向），只看裁决语句会把它误判成未知状态。
+				isLog := false
+				for _, st := range r.Stmts {
+					switch st.Kind {
+					case ir.StmtVerdict:
+						seg.Verdict = st.Verdict
+					case ir.StmtLog:
+						isLog = true
+					case ir.StmtNAT:
+						if st.NATKind == "dnat" || st.NATKind == "snat" || st.NATKind == "masquerade" {
+							seg.Verdict = "nat"
+						}
+					}
+				}
+				if seg.Verdict == "other" && isLog {
+					seg.Verdict = "log"
+				}
+				d.Segments = append(d.Segments, seg)
+			}
+			out = append(out, d)
+		}
+	}
+	return out
 }
 
 // Warning 是一条非阻断性提示。
@@ -489,6 +552,7 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 		p.Warnings = append(p.Warnings, Warning{Where: w.Where, Message: w.Message})
 	}
 	p.Diff = diffChains(applied, desired, e.copts)
+	p.ChainDetails = describeSegments(res.Snapshot)
 	return p, nil
 }
 

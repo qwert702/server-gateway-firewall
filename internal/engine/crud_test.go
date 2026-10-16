@@ -429,3 +429,66 @@ func idxOf(ss []string, s string) int {
 	}
 	return -1
 }
+
+// 规则指纹靠 Plan.ChainDetails 画出来。log 规则的特别之处在于它**没有**
+// 裁决语句（只记录、不决定去向），只看裁决语句会把它标成未知状态。
+func TestPlanChainDetailsLabelEveryKind(t *testing.T) {
+	e := crudEngine(t)
+	ctx := context.Background()
+
+	p := e.Policy()
+	p.Rules = []model.Rule{
+		{ID: "acc", SrcZone: "lan", DstZone: "wan", Action: model.ActionAccept},
+		{ID: "drp", SrcZone: "wan", DstZone: "lan", Action: model.ActionDrop},
+		{ID: "rej", SrcZone: "wan", DstZone: "lan", Proto: model.ProtoTCP,
+			DstPort: []string{"445"}, Action: model.ActionReject},
+		{ID: "lg", SrcZone: "wan", DstZone: "lan", Action: model.ActionLog},
+		{ID: "nat", SrcZone: "wan", DstZone: model.ZoneAny, Action: model.ActionAccept},
+	}
+	p.NATRules = []model.NATRule{{ID: "n", Kind: model.NATMasquerade, OutZone: "wan"}}
+	if err := e.SetPolicy(p); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, err := e.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := map[string]string{} // ruleID -> verdict
+	for _, c := range plan.ChainDetails {
+		for _, s := range c.Segments {
+			got[s.ID] = s.Verdict
+		}
+	}
+
+	for id, want := range map[string]string{
+		"acc": "accept", "drp": "drop", "rej": "reject", "lg": "log",
+	} {
+		found := false
+		for k, v := range got {
+			if strings.Contains(k, id) && v == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("规则 %s 的裁决应为 %s，实际:%v", id, want, got)
+		}
+	}
+
+	// NAT 规则必须落在 prerouting / postrouting 上并被标成 nat
+	for _, c := range plan.ChainDetails {
+		if c.Name == "postrouting" {
+			if len(c.Segments) == 0 || c.Segments[0].Verdict != "nat" {
+				t.Errorf("postrouting 的 NAT 规则未标成 nat: %+v", c.Segments)
+			}
+		}
+	}
+
+	// 每条链都要能给出默认策略，界面靠它画链尾的斜纹
+	for _, c := range plan.ChainDetails {
+		if (c.Name == "input" || c.Name == "forward" || c.Name == "output") && c.Policy == "" {
+			t.Errorf("链 %s 缺少默认策略信息", c.Name)
+		}
+	}
+}

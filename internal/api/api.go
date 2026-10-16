@@ -22,6 +22,7 @@ import (
 	"fwdd/internal/netcfg"
 	"fwdd/internal/obs"
 	"fwdd/internal/store"
+	"fwdd/internal/webui"
 )
 
 // Server 是 HTTP 服务。
@@ -70,6 +71,12 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET "+p+"/events", s.handleEvents)
 	s.mux.HandleFunc("GET "+p+"/events/recent", s.handleRecentEvents)
+
+	// 管理界面：静态资源挂在 /ui/ 下，根路径做个跳转。
+	s.mux.Handle("/ui/", webui.Handler("/ui/"))
+	s.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui/", http.StatusFound)
+	})
 	s.mux.HandleFunc("GET "+p+"/status", s.handleStatus)
 	s.mux.HandleFunc("GET "+p+"/policy", s.handleGetPolicy)
 	s.mux.HandleFunc("PUT "+p+"/policy", s.handlePutPolicy)
@@ -116,8 +123,10 @@ func (s *Server) routes() {
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// 健康检查与静态资源不需要认证。
-		if strings.HasSuffix(r.URL.Path, "/healthz") {
+		// 健康检查与界面静态资源不需要认证。
+		// 界面本身不含数据，数据接口仍然要过令牌；不这样放行的话，
+		// 用户连"输入令牌"这个页面都打不开。
+		if strings.HasSuffix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/ui/") {
 			next.ServeHTTP(w, r)
 			return
 		}

@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>fwdd · 网关防火墙</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<div class="shell">
+
+  <!-- 左轨：设备铭牌 + 导航 -->
+  <aside class="rail">
+    <div class="plate">
+      <div class="plate-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="26" height="26">
+          <!-- 三格栅：接口面板的抽象 -->
+          <rect x="3"  y="7"  width="26" height="4" rx="1"/>
+          <rect x="3"  y="14" width="26" height="4" rx="1"/>
+          <rect x="3"  y="21" width="26" height="4" rx="1"/>
+          <rect class="hot" x="3" y="14" width="9" height="4" rx="1"/>
+        </svg>
+      </div>
+      <div class="plate-text">
+        <span class="plate-name">fwdd</span>
+        <span class="plate-sub">GATEWAY FIREWALL</span>
+      </div>
+    </div>
+
+    <div class="rail-status" id="railStatus">
+      <span class="led" id="syncLed" data-state="unknown" title="期望状态与内核是否一致"></span>
+      <span class="rail-status-text" id="syncText">连接中…</span>
+    </div>
+
+    <nav class="nav" id="nav">
+      <a href="#/dashboard" data-page="dashboard"><span class="nav-key">01</span>总览</a>
+      <a href="#/rules"     data-page="rules"><span class="nav-key">02</span>规则</a>
+      <a href="#/zones"     data-page="zones"><span class="nav-key">03</span>安全域</a>
+      <a href="#/nat"       data-page="nat"><span class="nav-key">04</span>NAT</a>
+      <a href="#/bans"      data-page="bans"><span class="nav-key">05</span>封禁</a>
+      <a href="#/network"   data-page="network"><span class="nav-key">06</span>网络</a>
+      <a href="#/audit"     data-page="audit"><span class="nav-key">07</span>审计</a>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="rail-foot-row"><span>后端</span><b id="footBackend">—</b></div>
+      <div class="rail-foot-row"><span>表</span><b id="footTable">—</b></div>
+      <div class="rail-foot-row">
+        <span>事件流</span>
+        <b><span class="led led-sm" id="sseLed" data-state="off"></span><span id="sseText">未连接</span></b>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 主区 -->
+  <main class="main">
+    <header class="topbar">
+      <h1 class="page-title" id="pageTitle">总览</h1>
+      <div class="topbar-right">
+        <div class="annun" id="annunc" aria-live="polite"></div>
+        <button class="btn btn-ghost" id="refreshBtn" title="立即刷新">刷新</button>
+        <button class="btn btn-ghost" id="applyBtn" title="把期望状态下发到内核">下发</button>
+      </div>
+    </header>
+
+    <div class="viewport" id="view" tabindex="-1"></div>
+
+    <footer class="statusline">
+      <span id="statLineLeft">就绪</span>
+      <span class="statusline-right">
+        <span id="statLineClock">—</span>
+      </span>
+    </footer>
+  </main>
+
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<div class="modal-backdrop" id="modalBackdrop" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head">
+      <h2 id="modalTitle">标题</h2>
+      <button class="btn btn-ghost" id="modalClose" aria-label="关闭">✕</button>
+    </div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot" id="modalFoot"></div>
+  </div>
+</div>
+
+<div class="token-gate" id="tokenGate" hidden>
+  <form class="token-card" id="tokenForm">
+    <h2>需要访问令牌</h2>
+    <p>该接口开启了令牌校验。令牌会保存在本机浏览器中，不会发往别处。</p>
+    <input type="password" id="tokenInput" placeholder="粘贴 API 令牌" autocomplete="current-password" spellcheck="false">
+    <button class="btn btn-primary" type="submit">连接</button>
+    <p class="token-hint" id="tokenHint"></p>
+  </form>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
