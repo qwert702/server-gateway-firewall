@@ -21,6 +21,7 @@ import (
 	"fwdd/internal/backend"
 	"fwdd/internal/backend/mock"
 	"fwdd/internal/backend/nftables"
+	"fwdd/internal/ban"
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
@@ -168,7 +169,13 @@ func run() error {
 	// 后台维护：定期清理已过期的封禁记录。
 	eng.StartMaintenance(ctx)
 
-	srv := api.New(cfg, eng, netProvider, logger)
+	// 自动封禁：检测器 → 判罚引擎 → 封禁执行。
+	banEng, err := buildAutoBan(ctx, cfg, eng, logger)
+	if err != nil {
+		return err
+	}
+
+	srv := api.New(cfg, eng, netProvider, banEng, logger)
 	logger.Info("fwdd 启动完成", "backend", be.Name())
 	if err := srv.Serve(ctx); err != nil {
 		return err
@@ -225,6 +232,109 @@ func checkNetworking(ctx context.Context, np netcfg.Provider, cfg config.Config,
 			"key", c.Target, "current", c.From, "expected", c.To,
 			"提示", "设置 manage_sysctls: true 可让 fwdd 自动管理")
 	}
+}
+
+// startAutoBan 装配并启动自动封禁：检测器 → 判罚引擎 → 封禁执行。
+//
+// 关键取舍：默认只观察不封禁（auto_ban.enabled=false）。误封一个有合法用途的
+// 地址（监控探针、NAT 出口、爬虫）比漏封更难收拾，应该先看一段真实流量再打开。
+func buildAutoBan(ctx context.Context, cfg config.Config, eng *engine.Engine, logger *slog.Logger) (*ban.Engine, error) {
+	ab := cfg.AutoBan
+
+	// 未配置任何检测器时，enabled 本身就意味着"用 conntrack 检测"，
+	// 否则打开开关却什么都不检测，很容易让人以为功能坏了。
+	useConntrack := ab.Conntrack.Enabled
+	logSources := ab.Logs
+	if ab.Enabled && !useConntrack && len(logSources) == 0 {
+		useConntrack = true
+		logger.Info("auto_ban 已开启但未配置检测器，默认启用 conntrack 检测")
+	}
+	if !useConntrack && len(logSources) == 0 {
+		return nil, nil
+	}
+
+	settings := cfg.BanSettings()
+	be, err := ban.New(settings, ban.WithDecisionHook(func(d ban.Decision) {
+		if d.Action == ban.ActionBan {
+			logger.Warn("自动封禁",
+				"ip", d.IP, "ttl", d.TTL.String(), "第几次", d.Strikes, "原因", d.Reason)
+		} else if d.Action == ban.ActionObserve {
+			logger.Info("达到封禁阈值但未开启自动封禁（观察模式）",
+				"ip", d.IP, "原因", d.Reason)
+		}
+	}))
+	if err != nil {
+		return nil, fmt.Errorf("自动封禁配置无效: %w", err)
+	}
+
+	// 判罚结果直接落到 engine：写期望状态 → 落库 → 注入内核集合。
+	be.AttachSink(eng)
+	// 手工解封时清空计数窗口，否则残留事件会让它立刻又被封上。
+	eng.OnUnban(be.Forget)
+
+	events := make(chan ban.Event, 4096)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-events:
+				be.Observe(ev)
+			}
+		}
+	}()
+
+	var detectors []ban.Detector
+	if useConntrack {
+		cc := ab.Conntrack
+		detectors = append(detectors, &ban.ConntrackDetector{
+			Path:              cc.Path,
+			Interval:          cc.Interval,
+			MaxNewPerInterval: cc.MaxNewPerInterval,
+			MaxConcurrent:     cc.MaxConcurrent,
+		})
+		logger.Info("已启用 conntrack 检测",
+			"interval", orDefault(cc.Interval, 10*time.Second).String(),
+			"max_new_per_interval", cc.MaxNewPerInterval,
+			"max_concurrent", cc.MaxConcurrent)
+	}
+	for _, ls := range logSources {
+		pats := ls.Patterns
+		if len(pats) == 0 {
+			pats = ban.DefaultLogPatterns()
+		}
+		compiled, err := ban.CompilePatterns(pats)
+		if err != nil {
+			return nil, fmt.Errorf("日志检测器 %s 配置无效: %w", ls.Path, err)
+		}
+		detectors = append(detectors, &ban.LogWatcher{Path: ls.Path, Patterns: compiled, FromEnd: true})
+		logger.Info("已启用日志检测", "path", ls.Path, "特征数", len(compiled))
+	}
+
+	for _, d := range detectors {
+		go func(d ban.Detector) {
+			if err := d.Run(ctx, events); err != nil {
+				logger.Error("检测器退出", "detector", d.Name(), "err", err)
+			}
+		}(d)
+	}
+
+	mode := "观察模式（不封禁）"
+	if settings.Enabled {
+		mode = "封禁模式"
+	}
+	logger.Info("自动封禁已启动",
+		"模式", mode, "窗口", settings.Window.String(), "阈值", settings.Threshold,
+		"首次封禁", settings.BaseTTL.String(), "上限", settings.MaxTTL.String(),
+		"白名单", len(settings.Whitelist))
+	return be, nil
+}
+
+func orDefault(d, def time.Duration) time.Duration {
+	if d <= 0 {
+		return def
+	}
+	return d
 }
 
 func buildBackend(cfg config.Config, logger *slog.Logger) (backend.Backend, error) {

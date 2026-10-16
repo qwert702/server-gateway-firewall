@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -386,5 +387,97 @@ func TestBaselineBansImportedOnFirstBoot(t *testing.T) {
 	}
 	if len(stored) != 1 {
 		t.Errorf("基线封禁未写入数据库: %+v", stored)
+	}
+}
+
+// 自动封禁引擎通过 BanIP 执行封禁（实现 ban.Sink）。
+func TestBanIPCreatesAutoBan(t *testing.T) {
+	db := mustDB(t)
+	ctx := context.Background()
+	e, be := newPersistentEngine(t, db)
+	if _, err := e.Restore(ctx, basePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Apply(ctx, ApplyOptions{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := e.BanIP(ctx, "203.0.113.9", "日志命中 ssh-auth-fail", 30*time.Minute); err != nil {
+		t.Fatalf("BanIP 失败: %v", err)
+	}
+
+	bans := e.ListBans()
+	if len(bans) != 1 {
+		t.Fatalf("应产生 1 条封禁: %+v", bans)
+	}
+	b := bans[0]
+	if b.Source != model.BanAuto {
+		t.Errorf("来源应为 auto，实际 %q", b.Source)
+	}
+	if !strings.Contains(b.Reason, "ssh-auth-fail") {
+		t.Errorf("原因应保留检测源便于追溯: %q", b.Reason)
+	}
+	ttl := time.Until(b.ExpiresAt)
+	if ttl < 29*time.Minute || ttl > 31*time.Minute {
+		t.Errorf("封禁时长应约为 30m，实际 %s", ttl)
+	}
+
+	// 应已注入内核集合
+	elems, err := be.SetList(ctx, "banned4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(elems) != 1 || elems[0].Key != "203.0.113.9" {
+		t.Errorf("未注入内核集合: %+v", elems)
+	}
+
+	// 并且落库，重启后仍在
+	e2, _ := newPersistentEngine(t, db)
+	if _, err := e2.Restore(ctx, basePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if len(e2.ListBans()) != 1 {
+		t.Errorf("自动封禁未持久化: %+v", e2.ListBans())
+	}
+}
+
+// BanIP 未给时长时回落到默认封禁时长，而不是"永久封禁"。
+func TestBanIPDefaultsTTL(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if err := e.SetPolicy(basePolicy()); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.BanIP(ctx, "203.0.113.9", "测试", 0); err != nil {
+		t.Fatal(err)
+	}
+	b := e.ListBans()[0]
+	if b.ExpiresAt.IsZero() {
+		t.Fatal("未给时长不应变成永久封禁")
+	}
+	if d := time.Until(b.ExpiresAt); d < 23*time.Hour {
+		t.Errorf("应回落到默认 24h，实际 %s", d)
+	}
+}
+
+// 手工解封必须通知外部，否则判罚引擎窗口里的残留事件会让它立刻又被封上。
+func TestUnbanFiresHook(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if err := e.SetPolicy(basePolicy()); err != nil {
+		t.Fatal(err)
+	}
+
+	var got []string
+	e.OnUnban(func(ip string) { got = append(got, ip) })
+
+	if err := e.BanIP(ctx, "203.0.113.9", "测试", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Unban(ctx, "203.0.113.9"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != "203.0.113.9" {
+		t.Errorf("解封回调未收到通知: %v", got)
 	}
 }

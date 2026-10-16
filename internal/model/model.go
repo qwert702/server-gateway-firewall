@@ -157,6 +157,8 @@ const (
 	BanLog       BanSource = "log"
 	BanProbe     BanSource = "probe"
 	BanRateLimit BanSource = "ratelimit"
+	// BanAuto 由自动封禁引擎判定产生（具体检测源记在 reason 里）。
+	BanAuto BanSource = "auto"
 )
 
 // BanEntry 是一条封禁记录。主存储在 SQLite，运行时镜像到 nftables 集合。

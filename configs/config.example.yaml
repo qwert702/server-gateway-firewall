@@ -62,3 +62,51 @@ sysctls: []
 commit_confirm:
   enabled: false
   timeout: 60s
+
+# ---- 自动封禁 ----
+#
+# 强烈建议先用 enabled: false 跑一段时间：此时检测器照常工作、照常记录
+# 达到阈值的地址，只是不真的封。看一下"被封准了没有"再打开开关。
+# 误封一个有合法用途的地址（监控探针、NAT 出口、爬虫）比漏封更难收拾。
+auto_ban:
+  enabled: false
+
+  # 判定窗口与阈值：窗口内累计权重达到 threshold 即封禁。
+  window: 10m
+  threshold: 20
+
+  # 封禁时长：首次 base_ttl，每多违规一次乘以 multiplier，上限 max_ttl；
+  # 超过 strike_reset_after 没有新违规则计数清零。
+  base_ttl: 10m
+  multiplier: 2
+  max_ttl: 24h
+  strike_reset_after: 24h
+
+  # 白名单地址永不封禁。不配则至少包含本机回环，避免误判封掉管理面。
+  whitelist:
+    - 127.0.0.0/8
+    - ::1/128
+    # - 10.0.0.0/8          # 内网
+    # - 203.0.113.7         # 你的跳板机 / 监控
+
+  # conntrack 检测：单源新建连接速率与并发连接数。
+  conntrack:
+    enabled: false
+    path: /proc/net/nf_conntrack
+    interval: 10s
+    max_new_per_interval: 100   # 一个采样周期内新建连接数上限
+    max_concurrent: 200         # 并发连接数上限
+
+  # 日志检测：命中特征的来源地址计入判罚。
+  logs: []
+  #  logs:
+  #    - path: /var/log/auth.log          # 留空 patterns 则用内置特征集
+  #    - path: /var/log/kern.log
+  #      patterns:
+  #        - {name: ssh-auth-fail, regex: 'Failed password for .*? from (\S+)', weight: 2}
+  #
+  # 自定义特征的正则必须**恰好含一个捕获组**，捕获的就是要封的地址。
+  # 内置特征：ssh-auth-fail / ssh-invalid-user / ssh-max-attempts / nft-limit
+  #
+  # 关于 nft-limit：本工具生成的限速规则会打内核日志，特征从 SRC= 提取地址，
+  # 因此"某地址持续触发限速"会直接进入自动封禁判罚。

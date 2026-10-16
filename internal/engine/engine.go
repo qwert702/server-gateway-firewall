@@ -68,6 +68,9 @@ type Engine struct {
 
 	// onAutoRollback 在自动回滚发生后被调用（用于审计/告警）。
 	onAutoRollback func(to *model.Policy)
+
+	// onUnban 在手工解封后通知外部（自动封禁引擎据此清空计数窗口）。
+	onUnban func(ip string)
 }
 
 // Option 配置引擎。
@@ -902,6 +905,34 @@ func (e *Engine) Status(ctx context.Context) *Status {
 
 // ---- 封禁 ----
 
+// BanIP 实现 ban.Sink：自动封禁引擎判定后调用这里执行封禁。
+//
+// 与 Ban 的区别只在于入参形态（IP/原因/时长），执行路径完全相同：
+// 写期望状态 → 落库 → 注入内核集合。
+func (e *Engine) BanIP(ctx context.Context, ip, reason string, ttl time.Duration) error {
+	now := e.clock()
+	if ttl <= 0 {
+		ttl = e.copts.BanTimeout
+	}
+	return e.Ban(ctx, model.BanEntry{
+		IP:        ip,
+		Reason:    reason,
+		Source:    model.BanAuto,
+		AddedAt:   now,
+		ExpiresAt: now.Add(ttl),
+	})
+}
+
+// OnUnban 注册解封回调。
+//
+// 用于通知自动封禁引擎清掉该地址的计数窗口 —— 否则手工解封后，
+// 窗口里的残留事件会让它在下一条事件到来时立刻又被封上。
+func (e *Engine) OnUnban(fn func(ip string)) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onUnban = fn
+}
+
 // Ban 立即封禁一个地址并写入期望状态。
 func (e *Engine) Ban(ctx context.Context, entry model.BanEntry) error {
 	ip := entry.IP
@@ -961,6 +992,13 @@ func (e *Engine) Unban(ctx context.Context, ip string) error {
 	}
 	e.forgetBan(ctx, ip)
 	e.audit("ban.remove", ip, "")
+
+	e.mu.Lock()
+	unbanHook := e.onUnban
+	e.mu.Unlock()
+	if unbanHook != nil {
+		unbanHook(ip)
+	}
 
 	set := compiler.BanSetFor(ip, e.copts.BanSet4, e.copts.BanSet6)
 	if set == "" {

@@ -12,7 +12,7 @@
 
 ## 当前进度
 
-本项目按里程碑推进，**M1 + M2 + M3 已完成，M4 进行中**（见下方「路线图」）：
+本项目按里程碑推进，**M1–M5 已完成**（见下方「路线图」）：
 
 | 能力 | 状态 |
 | --- | --- |
@@ -27,7 +27,8 @@
 | 转发开关等内核网络参数管理与检查 | ✅ |
 | 网络状态清点（接口 / 地址 / 路由 / 策略路由） | ✅ |
 | 接口与路由的**写入**（最易自锁，需 commit-confirm 兜底） | ⏳ |
-| 自动封禁引擎、GeoIP、Web UI | ⏳ M5–M7 |
+| 自动封禁引擎（conntrack + 日志检测、递进惩罚、白名单） | ✅ |
+| GeoIP 国家拦截、Web 管理界面 | ⏳ M6–M7 |
 
 > 驱动真实 `nft` 的测试在无 nft 或非 root 环境下自动跳过，因此 `go test ./...`
 > 在 Windows/macOS 上也能跑；生成的规则集**尚未在真机校验过语法**，
@@ -127,6 +128,58 @@ sudo ./bin/fwdd -config /etc/fwdd/config.yaml -import-policy
 
 启动时的下发**不进入 commit-confirm 窗口**：本地策略文件是可信基线，
 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+
+---
+
+## 自动封禁
+
+检测可疑行为 → 滑动窗口累计加权 → 达阈值则封禁，且**越封越长**。
+
+```
+检测器                   判罚引擎                      执行
+conntrack 采样  ─┐                                  ┌─ 写期望状态
+日志特征匹配    ─┼─▶ 加权滑动窗口 ─▶ 达阈值 ─▶ 封禁 ─┼─ 落 SQLite
+手工 / API      ─┘   递进惩罚 · 白名单 · 上限保护    └─ 注入 nftables 集合
+```
+
+**默认只观察不封禁**（`auto_ban.enabled: false`）。此时检测器照常工作、照常记录
+达到阈值的地址，只是不真的封 —— 先跑一段时间看"封得准不准"，再打开开关。
+误封一个有合法用途的地址（监控探针、NAT 出口、爬虫）比漏封更难收拾。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `window` / `threshold` | 10m / 20 | 窗口内累计**权重**达标即封禁 |
+| `base_ttl` | 10m | 首次封禁时长 |
+| `multiplier` / `max_ttl` | 2 / 24h | 每多违规一次翻倍，有上限 |
+| `strike_reset_after` | 24h | 安静这么久就清零惩罚计数 |
+| `whitelist` | 回环 | 永不封禁；不配时至少护住本机 |
+
+**检测器**
+
+- **conntrack**：轮询 conntrack 表，用两次采样之差判断新建连接速率，
+  并统计单源并发连接数。不依赖 `nf_conntrack_acct`，任何内核都能用。
+- **日志**：跟踪文件（自动处理轮转），正则命中即计分。内置 sshd 认证失败、
+  无效用户、认证次数超限，以及本工具自己打的 nft 限速日志（从 `SRC=` 取地址）。
+  自定义特征的正则**必须恰好含一个捕获组**，捕获的就是要封的地址。
+
+```bash
+fw ban engine                  # 引擎状态：模式、阈值、跟踪与封禁计数
+fw ban engine --enable         # 运行时打开（不必重启）
+fw ban offenders               # 被跟踪的可疑地址，按可疑度倒序
+fw ban list                    # 已封禁的（来源标记为 auto）
+fw ban rm 203.0.113.9          # 手工解封
+```
+
+几个刻意的设计取舍：
+
+- **封禁后清空窗口**。否则解封瞬间残留计数会立刻把它重新封上。
+- **封禁期内不重复下发**。避免一条攻击打出一屏审计日志。
+- **跟踪表有上限**（默认 10 万），被海量随机源地址扫描时丢弃新来源并计数，
+  而不是无限吃内存。
+- **手工解封会通知判罚引擎清窗口**，同样是为了避免"解了马上又被封"。
+
+> 预置的限速/封禁只作用于**转发与本机入口**。想封自己的管理入口请用白名单护住，
+> 别让自动封禁把你自己挡在门外。
 
 ---
 
@@ -271,6 +324,8 @@ fw net sysctl show|apply [--dry-run]  查看 / 按基线写入内核网络参数
 fw policy get|set -f 文件 [--apply]
 fw zone list / fw rule list
 fw ban add <ip> [--ttl 秒] [--reason 文本] | fw ban list | fw ban rm <ip>
+fw ban engine [--enable|--disable]    自动封禁引擎状态与开关
+fw ban offenders                     被跟踪的可疑地址
 ```
 
 全局参数 `-config` 与 `-o json` 可出现在任意位置。
@@ -296,6 +351,8 @@ fw ban add <ip> [--ttl 秒] [--reason 文本] | fw ban list | fw ban rm <ip>
 | GET | `/net` | 网络状态与内核参数差异 |
 | POST | `/net/sysctls` | 写入内核网络参数（`?dry_run`） |
 | POST/PUT/DELETE | `/zones` `/rules` `/nat` | 策略对象增删改 |
+| GET/POST | `/ban/engine` | 自动封禁引擎状态与开关 |
+| GET | `/ban/offenders` | 被跟踪的可疑地址 |
 | GET/POST | `/bans`，DELETE `/bans/{ip}` | 封禁管理 |
 | GET | `/zones` `/rules` `/config` | 策略与配置查询 |
 
@@ -329,6 +386,7 @@ internal/api/        REST 接口与认证
 internal/client/     CLI 用的 API 客户端（Unix 套接字优先）
 internal/store/      SQLite 持久化（策略、封禁、审计、元数据）
 internal/netcfg/     内核网络参数与接口/路由清点（Linux 实现 + 其他平台桩）
+internal/ban/        自动封禁：检测器（conntrack/日志）+ 判罚引擎
 internal/config/     守护进程配置加载与校验
 configs/             配置与策略示例
 deploy/              验证脚本与 systemd 单元（M7 完善）
@@ -363,8 +421,9 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 - **M4（进行中）** 策略对象 CRUD；转发开关等内核网络参数的管理与检查；
   接口/地址/路由/策略路由的只读清点。接口与路由的**写入**尚未实现 ——
   这是最容易把自己锁死的操作，需要先把它接进 commit-confirm 兜底。
-- **M5** 限速与自动封禁引擎（conntrack 探测、日志解析、递增惩罚、白名单豁免）。
-- **M6** 认证与审计完善、Prometheus 指标、SSE 实时连接与日志、内嵌 Web UI。
+- **M5（已完成）** 自动封禁：conntrack 与日志检测器、加权滑动窗口、
+  递进惩罚、白名单、跟踪表上限、运行时开关。
+- **M6** 内嵌 Web 管理界面、SSE 实时连接与日志、Prometheus 指标、GeoIP。
 - **M7** GeoIP 国家拦截、大集合性能优化、systemd 打包、netns 端到端测试矩阵。
 
 ---
@@ -374,4 +433,5 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 - 网络配置目前只读：可以清点接口/地址/路由，可以管理内核参数，
   但**不能**写入接口地址或路由条目。
 - 未与既有 iptables 规则做共存策略；同一钩子上二者会按 priority 排序，接管前请确认。
-- GeoIP、连接数统计、日志流等读取类接口尚未实现。
+- GeoIP、连接数统计、日志流与 Web 管理界面尚未实现。
+- 自动封禁的 conntrack 检测器需要 Linux；日志检测器在任何平台都能用。

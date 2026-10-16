@@ -17,6 +17,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"fwdd/internal/ban"
 	"fwdd/internal/client"
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
@@ -62,6 +63,9 @@ const usage = `fw —— 服务器网关防火墙命令行
   fw ban add <ip> [--ttl 秒] [--reason 文本]
   fw ban list
   fw ban rm <ip>
+
+  fw ban engine [--enable|--disable]  自动封禁引擎状态与开关
+  fw ban offenders                 查看被跟踪的可疑地址
 
   fw net                           查看网络状态（接口/地址/路由/转发开关）
   fw net sysctl show               查看内核网络参数
@@ -917,6 +921,99 @@ func cmdNetSysctl(ctx context.Context, c *client.Client, out *os.File, format st
 	}
 }
 
+func cmdBanEngine(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	fs := flag.NewFlagSet("ban engine", flag.ContinueOnError)
+	enable := fs.Bool("enable", false, "打开自动封禁")
+	disable := fs.Bool("disable", false, "关闭自动封禁（转为只观察）")
+	if _, err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if *enable || *disable {
+		var resp map[string]any
+		body := map[string]any{"enabled": *enable}
+		if err := c.Post(ctx, "/ban/engine", body, &resp); err != nil {
+			return err
+		}
+		if *enable {
+			fmt.Fprintln(out, "自动封禁已开启")
+		} else {
+			fmt.Fprintln(out, "自动封禁已关闭（仍会观察并记录，但不再封禁）")
+		}
+		return nil
+	}
+
+	var resp struct {
+		Enabled  bool         `json:"enabled"`
+		Note     string       `json:"note"`
+		Settings ban.Settings `json:"settings"`
+		Stats    ban.Stats    `json:"stats"`
+	}
+	if err := c.Get(ctx, "/ban/engine", &resp); err != nil {
+		return err
+	}
+	if format == "json" {
+		return printJSON(out, resp)
+	}
+	if !resp.Enabled {
+		fmt.Fprintln(out, "自动封禁未启用")
+		if resp.Note != "" {
+			fmt.Fprintln(out, resp.Note)
+		}
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	mode := "仅观察（不封禁）"
+	if resp.Settings.Enabled {
+		mode = "封禁中"
+	}
+	fmt.Fprintf(w, "模式\t%s\n", mode)
+	fmt.Fprintf(w, "判定窗口\t%s\n", resp.Settings.Window)
+	fmt.Fprintf(w, "触发阈值\t窗口内累计 %d\n", resp.Settings.Threshold)
+	fmt.Fprintf(w, "首次封禁\t%s（每多一次翻 %g 倍，上限 %s）\n",
+		resp.Settings.BaseTTL, resp.Settings.Multiplier, resp.Settings.MaxTTL)
+	fmt.Fprintf(w, "白名单\t%d 项\n", len(resp.Settings.Whitelist))
+	fmt.Fprintf(w, "已观察事件\t%d\n", resp.Stats.Observed)
+	fmt.Fprintf(w, "跟踪中地址\t%d\n", resp.Stats.Tracked)
+	fmt.Fprintf(w, "当前封禁中\t%d\n", resp.Stats.Banned)
+	if resp.Stats.Dropped > 0 {
+		fmt.Fprintf(w, "已丢弃\t%d（跟踪表已满，可能正在被大规模扫描）\n", resp.Stats.Dropped)
+	}
+	return w.Flush()
+}
+
+func cmdBanOffenders(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	var resp struct {
+		Offenders []ban.Offender `json:"offenders"`
+		Note      string         `json:"note"`
+	}
+	if err := c.Get(ctx, "/ban/offenders", &resp); err != nil {
+		return err
+	}
+	if format == "json" {
+		return printJSON(out, resp.Offenders)
+	}
+	if len(resp.Offenders) == 0 {
+		if resp.Note != "" {
+			fmt.Fprintln(out, resp.Note)
+			return nil
+		}
+		fmt.Fprintln(out, "（当前没有被跟踪的可疑地址）")
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "地址\t可疑度\t事件数\t违规次数\t封禁至\t来源")
+	now := time.Now()
+	for _, o := range resp.Offenders {
+		banned := "-"
+		if !o.BannedUntil.IsZero() && o.BannedUntil.After(now) {
+			banned = o.BannedUntil.Format("15:04:05")
+		}
+		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\t%s\n",
+			o.IP, o.Score, o.Events, o.Strikes, banned, orDash(strings.Join(o.Sources, ",")))
+	}
+	return w.Flush()
+}
+
 func cmdBan(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
 	if len(args) == 0 {
 		return errors.New("用法: fw ban add|list|rm")
@@ -965,6 +1062,10 @@ func cmdBan(ctx context.Context, c *client.Client, out *os.File, format string, 
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", b.IP, remaining(b, now), orDash(string(b.Source)), orDash(b.Reason))
 		}
 		return w.Flush()
+	case "engine":
+		return cmdBanEngine(ctx, c, out, format, args[1:])
+	case "offenders":
+		return cmdBanOffenders(ctx, c, out, format, args[1:])
 	case "rm", "del", "remove":
 		ip := ""
 		if len(args) > 1 {

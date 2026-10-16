@@ -15,6 +15,8 @@ import (
 
 	"fwdd/internal/netcfg"
 
+	"fwdd/internal/ban"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -56,6 +58,84 @@ type Config struct {
 	ManageSysctls bool `yaml:"manage_sysctls" json:"manage_sysctls"`
 	// Sysctls 为内核网络参数；为空时使用网关推荐基线。
 	Sysctls []netcfg.Sysctl `yaml:"sysctls" json:"sysctls,omitempty"`
+
+	// AutoBan 是自动封禁配置。
+	AutoBan AutoBanConfig `yaml:"auto_ban" json:"auto_ban"`
+}
+
+// AutoBanConfig 是自动封禁的配置（yaml 可读形态）。
+type AutoBanConfig struct {
+	// Enabled 为 false 时只观察、不封禁，用于先评估误报率。
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Window 是判定用的滑动窗口。
+	Window time.Duration `yaml:"window" json:"window"`
+	// Threshold 是窗口内累计权重达到多少即封禁。
+	Threshold int `yaml:"threshold" json:"threshold"`
+	// BaseTTL 是首次封禁时长。
+	BaseTTL time.Duration `yaml:"base_ttl" json:"base_ttl"`
+	// Multiplier 是递进惩罚倍数。
+	Multiplier float64 `yaml:"multiplier" json:"multiplier"`
+	// MaxTTL 是封禁时长上限。
+	MaxTTL time.Duration `yaml:"max_ttl" json:"max_ttl"`
+	// StrikeResetAfter 为多久没有新违规就清零惩罚计数。
+	StrikeResetAfter time.Duration `yaml:"strike_reset_after" json:"strike_reset_after"`
+	// Whitelist 中的地址永不封禁。建议至少包含管理网段。
+	Whitelist []string `yaml:"whitelist" json:"whitelist,omitempty"`
+
+	Conntrack ConntrackConfig   `yaml:"conntrack" json:"conntrack"`
+	Logs      []LogSourceConfig `yaml:"logs" json:"logs,omitempty"`
+}
+
+// ConntrackConfig 配置 conntrack 检测器。
+type ConntrackConfig struct {
+	Enabled bool `yaml:"enabled" json:"enabled"`
+	// Path 默认 /proc/net/nf_conntrack。
+	Path string `yaml:"path" json:"path"`
+	// Interval 是采样周期。
+	Interval time.Duration `yaml:"interval" json:"interval"`
+	// MaxNewPerInterval：单源在一个采样周期内新增连接数阈值。
+	MaxNewPerInterval int `yaml:"max_new_per_interval" json:"max_new_per_interval"`
+	// MaxConcurrent：单源并发连接数阈值。
+	MaxConcurrent int `yaml:"max_concurrent" json:"max_concurrent"`
+}
+
+// LogSourceConfig 配置一个日志检测器。
+type LogSourceConfig struct {
+	Path string `yaml:"path" json:"path"`
+	// Patterns 为空时使用内置特征集（sshd 认证失败、nft 限速日志等）。
+	Patterns []ban.LogPattern `yaml:"patterns" json:"patterns,omitempty"`
+}
+
+// BanSettings 把配置转换为判罚引擎的设置。
+func (c *Config) BanSettings() ban.Settings {
+	a := c.AutoBan
+	s := ban.DefaultSettings()
+	s.Enabled = a.Enabled
+	if a.Window > 0 {
+		s.Window = a.Window
+	}
+	if a.Threshold > 0 {
+		s.Threshold = a.Threshold
+	}
+	if a.BaseTTL > 0 {
+		s.BaseTTL = a.BaseTTL
+	}
+	if a.Multiplier > 0 {
+		s.Multiplier = a.Multiplier
+	}
+	if a.MaxTTL > 0 {
+		s.MaxTTL = a.MaxTTL
+	}
+	if a.StrikeResetAfter > 0 {
+		s.StrikeResetAfter = a.StrikeResetAfter
+	}
+	if len(a.Whitelist) > 0 {
+		s.Whitelist = a.Whitelist
+	} else {
+		// 没配白名单时至少要护住本机与内网，否则一次误判就可能把管理面封掉。
+		s.Whitelist = []string{"127.0.0.0/8", "::1/128"}
+	}
+	return s
 }
 
 // SysctlBaseline 返回本次启动应使用的内核参数基线。

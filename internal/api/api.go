@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"fwdd/internal/ban"
 	"fwdd/internal/compiler"
 	"fwdd/internal/config"
 	"fwdd/internal/engine"
@@ -27,20 +28,21 @@ type Server struct {
 	cfg    config.Config
 	engine *engine.Engine
 	net    netcfg.Provider
+	ban    *ban.Engine
 	log    *slog.Logger
 	mux    *http.ServeMux
 	start  time.Time
 }
 
 // New 构造 API 服务。
-func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, log *slog.Logger) *Server {
+func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, banEng *ban.Engine, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	if net == nil {
 		net = netcfg.New()
 	}
-	s := &Server{cfg: cfg, engine: e, net: net, log: log, mux: http.NewServeMux(), start: time.Now()}
+	s := &Server{cfg: cfg, engine: e, net: net, ban: banEng, log: log, mux: http.NewServeMux(), start: time.Now()}
 	s.routes()
 	return s
 }
@@ -66,6 +68,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET "+p+"/bans", s.handleListBans)
 	s.mux.HandleFunc("POST "+p+"/bans", s.handleAddBan)
 	s.mux.HandleFunc("DELETE "+p+"/bans/{ip}", s.handleDeleteBan)
+
+	s.mux.HandleFunc("GET "+p+"/ban/engine", s.handleBanEngine)
+	s.mux.HandleFunc("POST "+p+"/ban/engine", s.handleBanEngineToggle)
+	s.mux.HandleFunc("GET "+p+"/ban/offenders", s.handleBanOffenders)
 	s.mux.HandleFunc("GET "+p+"/zones", s.handleListZones)
 	s.mux.HandleFunc("POST "+p+"/zones", s.handleAddZone)
 	s.mux.HandleFunc("PUT "+p+"/zones/{name}", s.handleUpdateZone)
@@ -333,6 +339,54 @@ func (s *Server) handleDeleteBan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"unbanned": ip})
+}
+
+// ---- 自动封禁引擎 ----
+
+func (s *Server) handleBanEngine(w http.ResponseWriter, r *http.Request) {
+	if s.ban == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"enabled": false,
+			"note":    "自动封禁未启用（配置 auto_ban.enabled: true 打开）",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":   true,
+		"settings":  s.ban.Settings(),
+		"stats":     s.ban.Stats(),
+		"offenders": s.ban.Offenders(),
+		"decisions": s.ban.Decisions(),
+	})
+}
+
+func (s *Server) handleBanEngineToggle(w http.ResponseWriter, r *http.Request) {
+	if s.ban == nil {
+		writeError(w, http.StatusNotImplemented, "自动封禁未启用")
+		return
+	}
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if !decodeBody(w, r, &req) {
+		return
+	}
+	s.ban.SetEnabled(req.Enabled)
+	s.log.Warn("自动封禁开关被更改", "enabled", req.Enabled, "remote", r.RemoteAddr)
+	writeJSON(w, http.StatusOK, map[string]any{"enabled": req.Enabled})
+}
+
+// handleBanOffenders 返回当前被跟踪的最可疑地址。
+func (s *Server) handleBanOffenders(w http.ResponseWriter, r *http.Request) {
+	if s.ban == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"offenders": []any{}, "note": "自动封禁未启用"})
+		return
+	}
+	off := s.ban.Offenders()
+	if off == nil {
+		off = []ban.Offender{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"offenders": off, "count": len(off)})
 }
 
 func (s *Server) handleListZones(w http.ResponseWriter, r *http.Request) {
