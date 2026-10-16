@@ -20,41 +20,56 @@ import (
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
 	"fwdd/internal/netcfg"
+	"fwdd/internal/obs"
 	"fwdd/internal/store"
 )
 
 // Server 是 HTTP 服务。
 type Server struct {
-	cfg    config.Config
-	engine *engine.Engine
-	net    netcfg.Provider
-	ban    *ban.Engine
-	log    *slog.Logger
-	mux    *http.ServeMux
-	start  time.Time
+	cfg     config.Config
+	engine  *engine.Engine
+	net     netcfg.Provider
+	metrics *obs.Metrics
+	bus     *obs.Bus
+	ban     *ban.Engine
+	log     *slog.Logger
+	mux     *http.ServeMux
+	start   time.Time
 }
 
 // New 构造 API 服务。
-func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, banEng *ban.Engine, log *slog.Logger) *Server {
+func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, banEng *ban.Engine, metrics *obs.Metrics, bus *obs.Bus, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
 	if net == nil {
 		net = netcfg.New()
 	}
-	s := &Server{cfg: cfg, engine: e, net: net, ban: banEng, log: log, mux: http.NewServeMux(), start: time.Now()}
+	s := &Server{
+		cfg: cfg, engine: e, net: net, ban: banEng,
+		metrics: metrics, bus: bus,
+		log: log, mux: http.NewServeMux(), start: time.Now(),
+	}
 	s.routes()
 	return s
 }
 
 // Handler 返回带认证中间件的 http.Handler。
 func (s *Server) Handler() http.Handler {
-	return s.auth(s.logRequests(s.mux))
+	var h http.Handler = s.mux
+	if s.metrics != nil {
+		h = s.metrics.Middleware(h)
+	}
+	return s.auth(s.logRequests(h))
 }
 
 func (s *Server) routes() {
 	p := "/api/v1"
 	s.mux.HandleFunc("GET "+p+"/healthz", s.handleHealthz)
+	// /metrics 刻意不带 /api/v1 前缀：Prometheus 的默认约定是根路径下的 /metrics。
+	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
+	s.mux.HandleFunc("GET "+p+"/events", s.handleEvents)
+	s.mux.HandleFunc("GET "+p+"/events/recent", s.handleRecentEvents)
 	s.mux.HandleFunc("GET "+p+"/status", s.handleStatus)
 	s.mux.HandleFunc("GET "+p+"/policy", s.handleGetPolicy)
 	s.mux.HandleFunc("PUT "+p+"/policy", s.handlePutPolicy)
@@ -159,6 +174,12 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 	})
 }
 
+// recorder 记录状态码。
+//
+// 必须转发 Flush：SSE 处理器会做 `w.(http.Flusher)` 断言。少这一个方法，
+// 断言在最内层会失败，flush 到不了真正的连接，响应头与事件全被缓冲住 ——
+// 表现为"订阅上了但一个字节都收不到"，而且服务端不报任何错。
+// 每包一层 ResponseWriter 都要记得转发这一组方法。
 type recorder struct {
 	http.ResponseWriter
 	status int
@@ -167,6 +188,13 @@ type recorder struct {
 func (r *recorder) WriteHeader(code int) {
 	r.status = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+// Flush 透传到底层 ResponseWriter。
+func (r *recorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // ---- Handlers ----
@@ -339,6 +367,81 @@ func (s *Server) handleDeleteBan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"unbanned": ip})
+}
+
+// ---- 可观测性 ----
+
+// handleMetrics 暴露 Prometheus 指标。
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if s.metrics == nil {
+		writeError(w, http.StatusNotImplemented, "指标未启用")
+		return
+	}
+	s.metrics.Handler().ServeHTTP(w, r)
+}
+
+// handleEvents 是 SSE 实时事件流。
+func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	if s.bus == nil {
+		writeError(w, http.StatusNotImplemented, "事件流未启用")
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "当前连接不支持流式响应")
+		return
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	// 反向代理常会缓冲 SSE，这里显式关掉。
+	h.Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	events, cancel := s.bus.Subscribe(128)
+	defer cancel()
+
+	// 心跳：既能让中间设备保持连接，也能让客户端及时发现断线。
+	ticker := time.NewTicker(20 * time.Second)
+	defer ticker.Stop()
+
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+		case ev, ok := <-events:
+			if !ok {
+				return
+			}
+			if _, err := fmt.Fprint(w, "event: fwdd\n"); err != nil {
+				return
+			}
+			if _, err := fmt.Fprint(w, "data: "); err != nil {
+				return
+			}
+			if err := enc.Encode(ev); err != nil { // Encode 会自行换行
+				return
+			}
+			fmt.Fprint(w, "\n")
+			flusher.Flush()
+		}
+	}
+}
+
+// handleRecentEvents 返回最近的事件，供页面首次加载时立即填充。
+func (s *Server) handleRecentEvents(w http.ResponseWriter, r *http.Request) {
+	if s.bus == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"events": []obs.Event{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": s.bus.Recent(intParam(r, "limit", 50))})
 }
 
 // ---- 自动封禁引擎 ----

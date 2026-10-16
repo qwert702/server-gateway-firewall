@@ -21,6 +21,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fwdd/internal/backend"
@@ -71,6 +72,11 @@ type Engine struct {
 
 	// onUnban 在手工解封后通知外部（自动封禁引擎据此清空计数窗口）。
 	onUnban func(ip string)
+
+	// onEvent 把审计动作实时推给事件流（Web 界面的实时视图）。
+	// 用原子指针而不是普通字段 + 锁：audit() 既会在持锁时被调用（Confirm），
+	// 也会在不持锁时被调用，若这里再取一次 e.mu 就会自死锁。
+	onEvent atomic.Pointer[func(action, target, detail string)]
 }
 
 // Option 配置引擎。
@@ -202,6 +208,10 @@ func (e *Engine) forgetBan(ctx context.Context, ip string) {
 
 // audit 记录一条审计日志。db 为 nil 时静默跳过。
 func (e *Engine) audit(action, target, detail string) {
+
+	if fn := e.eventHook(); fn != nil {
+		fn(action, target, detail)
+	}
 	if e.db == nil {
 		return
 	}
@@ -1086,4 +1096,21 @@ func sortStrings(s []string) { sort.Strings(s) }
 func isV6(addr string) bool {
 	ip := net.ParseIP(addr)
 	return ip != nil && ip.To4() == nil
+}
+
+// OnEvent 注册实时事件回调。回调在写操作路径上被调用，必须快速返回。
+// OnEvent 注册实时事件回调。回调在写操作路径上被调用，必须快速返回。
+func (e *Engine) OnEvent(fn func(action, target, detail string)) {
+	if fn == nil {
+		e.onEvent.Store(nil)
+		return
+	}
+	e.onEvent.Store(&fn)
+}
+
+func (e *Engine) eventHook() func(string, string, string) {
+	if p := e.onEvent.Load(); p != nil {
+		return *p
+	}
+	return nil
 }

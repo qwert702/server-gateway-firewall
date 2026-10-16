@@ -26,6 +26,7 @@ import (
 	"fwdd/internal/engine"
 	"fwdd/internal/model"
 	"fwdd/internal/netcfg"
+	"fwdd/internal/obs"
 	"fwdd/internal/store"
 	"gopkg.in/yaml.v3"
 )
@@ -175,7 +176,14 @@ func run() error {
 		return err
 	}
 
-	srv := api.New(cfg, eng, netProvider, banEng, logger)
+	// 可观测性：事件总线（SSE 实时视图）与 Prometheus 指标。
+	bus := obs.NewBus(300)
+	eng.OnEvent(func(action, target, detail string) {
+		bus.Publish(obs.Event{Kind: action, Target: target, Detail: detail})
+	})
+	metrics := obs.New(eng, banEng, be.Name(), cfg.Table)
+
+	srv := api.New(cfg, eng, netProvider, banEng, metrics, bus, logger)
 	logger.Info("fwdd 启动完成", "backend", be.Name())
 	if err := srv.Serve(ctx); err != nil {
 		return err

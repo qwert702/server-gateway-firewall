@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -479,5 +480,59 @@ func TestUnbanFiresHook(t *testing.T) {
 	}
 	if len(got) != 1 || got[0] != "203.0.113.9" {
 		t.Errorf("解封回调未收到通知: %v", got)
+	}
+}
+
+// 回归测试：audit 会被持锁的路径调用（Confirm），又被不持锁的路径调用（Update）。
+// 事件钩子若在这里取锁就会自死锁 —— 表现为测试挂死到 10 分钟超时。
+func TestEventHookCalledFromLockedPathDoesNotDeadlock(t *testing.T) {
+	e, _ := newEngine(t)
+	ctx := context.Background()
+	if err := e.SetPolicy(basePolicy()); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var events []string
+	e.OnEvent(func(action, _, _ string) {
+		mu.Lock()
+		events = append(events, action)
+		mu.Unlock()
+	})
+
+	// Confirm 在持锁状态下调用 audit
+	if _, err := e.Apply(ctx, ApplyOptions{WithConfirm: true, ConfirmTimeout: time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- e.Confirm() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Confirm 死锁：事件钩子不能在上锁路径里再取一次锁")
+	}
+
+	// 不持锁的路径同样要能触发
+	if err := e.Ban(ctx, model.BanEntry{IP: "203.0.113.9", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	var hasConfirm, hasBan bool
+	for _, a := range events {
+		if a == "confirm" {
+			hasConfirm = true
+		}
+		if a == "ban.add" {
+			hasBan = true
+		}
+	}
+	if !hasConfirm || !hasBan {
+		t.Errorf("事件钩子未被两条路径都触发: %v", events)
 	}
 }

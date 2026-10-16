@@ -18,11 +18,11 @@ build:
 
 ## test: 单元测试（驱动 nft 的用例在非 Linux/非 root 下自动跳过）
 test:
-	go test -count=1 $(PKGS)
+	go test -count=1 -timeout 120s $(PKGS)
 
 ## test-race: 竞态检测（需 Linux 或 darwin，windows/386 不支持）
 test-race:
-	go test -race -count=1 $(PKGS)
+	go test -race -count=1 -timeout 300s $(PKGS)
 
 ## vet: 静态检查
 vet:
