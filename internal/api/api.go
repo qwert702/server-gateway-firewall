@@ -22,6 +22,7 @@ import (
 	"fwdd/internal/netcfg"
 	"fwdd/internal/obs"
 	"fwdd/internal/store"
+	"fwdd/internal/version"
 	"fwdd/internal/webui"
 )
 
@@ -67,6 +68,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) routes() {
 	p := "/api/v1"
 	s.mux.HandleFunc("GET "+p+"/healthz", s.handleHealthz)
+	s.mux.HandleFunc("GET "+p+"/version", s.handleVersion)
 	// /metrics 刻意不带 /api/v1 前缀：Prometheus 的默认约定是根路径下的 /metrics。
 	s.mux.HandleFunc("GET /metrics", s.handleMetrics)
 	s.mux.HandleFunc("GET "+p+"/events", s.handleEvents)
@@ -128,7 +130,8 @@ func (s *Server) auth(next http.Handler) http.Handler {
 		// 健康检查与界面静态资源不需要认证。
 		// 界面本身不含数据，数据接口仍然要过令牌；不这样放行的话，
 		// 用户连"输入令牌"这个页面都打不开。
-		if strings.HasSuffix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/ui/") {
+		// 版本与健康检查也不拦：探活与"跑的哪个构建"不该需要凭据。
+		if strings.HasSuffix(r.URL.Path, "/healthz") || strings.HasSuffix(r.URL.Path, "/version") || strings.HasPrefix(r.URL.Path, "/ui/") {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -215,7 +218,13 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"ok":      true,
 		"uptime":  time.Since(s.start).Round(time.Second).String(),
 		"backend": s.engine.Backend().Name(),
+		"version": version.Get(),
 	})
+}
+
+// handleVersion 返回构建信息，便于确认线上跑的是哪个构建。
+func (s *Server) handleVersion(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, version.Get())
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {

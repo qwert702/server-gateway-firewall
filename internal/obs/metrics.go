@@ -18,10 +18,8 @@ import (
 
 	"fwdd/internal/ban"
 	"fwdd/internal/engine"
+	"fwdd/internal/version"
 )
-
-// Version 是本进程的版本标识，导出到 fwdd_info。
-const Version = "0.6.0"
 
 // Metrics 持有指标注册表。
 type Metrics struct {
@@ -102,7 +100,7 @@ func (c *stateCollector) Collect(ch chan<- prometheus.Metric) {
 	counter := func(name, help string, v float64) { emit(name, help, prometheus.CounterValue, v, nil) }
 
 	emit("fwdd_info", "构建与后端信息，恒为 1", prometheus.GaugeValue, 1,
-		[]string{"version", "backend", "table"}, Version, c.backend, c.table)
+		[]string{"version", "backend", "table"}, version.Version, c.backend, c.table)
 
 	st := c.eng.Status(ctx)
 	gauge("fwdd_zones_total", "安全域数量", float64(st.Desired.Zones))

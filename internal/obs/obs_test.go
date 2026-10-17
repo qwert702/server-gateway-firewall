@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"fwdd/internal/ban"
+	"fwdd/internal/version"
 )
 
 func TestNormalizePathBoundsCardinality(t *testing.T) {
@@ -147,7 +148,7 @@ func TestMetricsCollectorExposesCorrectLabels(t *testing.T) {
 	body := rec.Body.String()
 
 	for _, want := range []string{
-		`fwdd_info{backend="mock",table="fw",version="0.6.0"}`,
+		`fwdd_info{backend="mock",table="fw",version="` + version.Version + `"}`,
 		`fwdd_rules_total `,
 		`fwdd_in_sync `,
 		`fwdd_chain_rules{chain="forward"}`,

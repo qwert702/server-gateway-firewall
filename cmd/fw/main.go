@@ -24,6 +24,7 @@ import (
 	"fwdd/internal/model"
 	"fwdd/internal/netcfg"
 	"fwdd/internal/store"
+	"fwdd/internal/version"
 	"gopkg.in/yaml.v3"
 )
 
@@ -117,7 +118,11 @@ func run(args []string, out *os.File) error {
 		fmt.Fprint(out, usage)
 		return nil
 	case "version":
-		fmt.Fprintln(out, "fw 0.1.0 (M1+M2)")
+		if len(sub) > 0 && (sub[0] == "-v" || sub[0] == "--verbose") {
+			fmt.Fprintln(out, version.Full())
+			return nil
+		}
+		fmt.Fprintln(out, "fw "+version.Short())
 		return nil
 	case "status":
 		return cmdStatus(ctx, c, out, format)

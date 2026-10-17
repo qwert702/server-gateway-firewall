@@ -28,6 +28,7 @@ import (
 	"fwdd/internal/netcfg"
 	"fwdd/internal/obs"
 	"fwdd/internal/store"
+	"fwdd/internal/version"
 	"gopkg.in/yaml.v3"
 )
 
@@ -50,12 +51,12 @@ func run() error {
 		importPolicy = flag.Bool("import-policy", false, "用 -policy 文件覆盖数据库中的期望状态")
 		actor        = flag.String("actor", "fwdd", "审计日志中的操作者标识")
 		logLevel     = flag.String("log-level", "", "覆盖日志级别：debug|info|warn|error")
-		version      = flag.Bool("version", false, "打印版本并退出")
+		showVersion  = flag.Bool("version", false, "打印版本并退出")
 	)
 	flag.Parse()
 
-	if *version {
-		fmt.Println("fwdd 0.1.0 (M1+M2)")
+	if *showVersion {
+		fmt.Println("fwdd " + version.Short())
 		return nil
 	}
 

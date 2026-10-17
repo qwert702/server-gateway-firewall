@@ -40,6 +40,34 @@
 
 ---
 
+## 部署
+
+### 安装
+
+```bash
+make release                      # 交叉编译并打包（linux/amd64 + linux/arm64）
+tar -xzf bin/release/fwdd-*-linux-amd64.tar.gz
+sudo ./deploy/install.sh fwdd-*-linux-amd64   # 或直接 sudo ./deploy/install.sh bin
+```
+
+安装脚本会装二进制到 `/usr/local/sbin`、建 `/etc/fwdd`（0700）与 `/var/lib/fwdd`（0700）、
+铺示例配置、生成随机 API 令牌（0600）、装 systemd 单元。
+
+**它刻意不启动服务。** 默认策略是 input / forward 全 drop，在确认管理面放行规则
+之前就启动，很可能把你自己关在门外。脚本最后会打印启用前该检查的三件事。
+
+### 构建时注入版本
+
+```bash
+make build                        # 版本自动取 git describe --tags --always
+make build VERSION=1.0.0
+```
+
+版本号通过 `-ldflags` 注入 `internal/version`，`fw version`、`/api/v1/version`、
+`fwdd_info` 指标三处共用同一个来源 —— 之前它们各自写死了一个常量，结果对不上。
+
+---
+
 ## 快速开始
 
 ### 1. 离线体验（无需 root、无需 Linux）
@@ -541,7 +569,9 @@ deploy/              验证脚本与 systemd 单元（M7 完善）
 ## 开发
 
 ```bash
-make build         # 构建两个二进制到 bin/
+make build         # 构建两个二进制到 bin/（自动注入版本）
+make release       # 交叉编译并打包发布产物
+
 make test          # 单元测试
 make vet           # go vet
 make cross         # 交叉编译 linux/amd64 与 linux/arm64
@@ -568,7 +598,7 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 - **M5（已完成）** 自动封禁：conntrack 与日志检测器、加权滑动窗口、
   递进惩罚、白名单、跟踪表上限、运行时开关。
 - **M6（已完成）** 内嵌 Web 管理界面、SSE 实时事件流、Prometheus 指标。
-- **M7** 大集合性能优化、打包与 netns 端到端测试矩阵。
+- **M7** 大集合性能优化、netns 端到端测试矩阵；接口与路由的写入。
 
 ---
 
