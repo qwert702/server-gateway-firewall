@@ -43,6 +43,13 @@ type Config struct {
 	// 这种情形的求值顺序是未定义的 —— 网关模式装在有 Docker 的机器上，
 	// 容器网络会不会被打断是看运气的。主机模式不注册 forward 链，从根上避开。
 	Mode string `yaml:"mode" json:"mode"`
+	// InputPriority 覆盖 input/output 链的钩子优先级（0 = 默认 filter）。
+	//
+	// 设成 10 可以让本工具**叠加在既有防火墙之上**：实测（nft 1.0.9）确认
+	// 多条基础链按优先级依次执行，前一条的 accept 不阻止后一条继续判定。
+	// 配合 default.input=accept 与只写丢弃规则，就能做到
+	// "ufw 继续管放行，本工具叠加做封禁与限速"，不必停用既有防火墙。
+	InputPriority int `yaml:"input_priority" json:"input_priority"`
 	// Table / Family 指定 nft 表名与地址族。
 	Table  string `yaml:"table" json:"table"`
 	Family string `yaml:"family" json:"family"`

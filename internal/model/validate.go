@@ -225,6 +225,13 @@ func (p *Policy) Validate() []Problem {
 				ps = append(ps, errf(where,
 					"limit.max_concurrent 需要协议为 tcp 或 udp（并发连接数对 %s 没有意义）", orAny(r.Proto)))
 			}
+			// 按源限速只能表达"超额"（nft 没有"按源、限内"的写法），
+			// 所以它必然意味着"超额就丢"。对纯记录日志的规则用它会把它变成丢弃规则。
+			if r.Limit.PerIP && r.Limit.Rate > 0 && r.Action == ActionLog {
+				ps = append(ps, errf(where,
+					"action=log 不能用 limit.per_ip：按源限速在 nft 里只能表达「超额即丢弃」，"+
+						"会把纯记录规则变成丢弃规则。要限制日志速率请去掉 per_ip 用全局限速"))
+			}
 		}
 	}
 

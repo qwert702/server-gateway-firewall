@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"fwdd/internal/ir"
 	"fwdd/internal/model"
 )
 
@@ -768,4 +769,162 @@ func TestConnLimitSetHasNoTimeoutFlag(t *testing.T) {
 			t.Errorf("ctlimit 集合的 flags 里出现了 timeout:\n%s", line)
 		}
 	}
+}
+
+// ---- limit 的极性（2026-10-17 在真机 nft 1.0.9 上实测后钉死）----
+//
+// nft 的 limit 有两种极性，写错会**正好相反**：
+//
+//	limit rate N/unit       匹配"未超额"的包 —— 配 accept
+//	limit rate over N/unit  匹配"超额"的包   —— 配 drop
+//
+// meter 与 ct count 只有 over 这一种写法。实测：单条
+// `add @S { ip saddr limit rate over 2/second } accept` 配 drop 默认策略，
+// 12 次连接**一次都进不来** —— 等于把 SSH 打死。
+func TestLimitPolarityMatchesAction(t *testing.T) {
+	mk := func(id string, action model.Action, lim *model.RateLimit) *model.Policy {
+		return &model.Policy{
+			Rules: []model.Rule{{
+				ID: id, Priority: 10, SrcZone: model.ZoneAny, DstZone: model.ZoneLocal,
+				Proto: model.ProtoTCP, DstPort: []string{"80"}, Action: action, Limit: lim,
+			}},
+			Default: model.DefaultPolicy{Input: model.ActionDrop, Output: model.ActionAccept},
+		}
+	}
+
+	cases := []struct {
+		name   string
+		policy *model.Policy
+		// 渲染文本里必须出现（顺序敏感，用切片）
+		inOrder []string
+	}{
+		{
+			name:    "accept + 全局限速 → limit rate（未超额）",
+			policy:  mk("a", model.ActionAccept, &model.RateLimit{Rate: 100, Per: "second"}),
+			inOrder: []string{"limit rate 100/second accept"},
+		},
+		{
+			name:    "drop + 全局限速 → limit rate over（超额）",
+			policy:  mk("d", model.ActionDrop, &model.RateLimit{Rate: 50, Per: "second"}),
+			inOrder: []string{"limit rate over 50/second drop"},
+		},
+		{
+			name:   "accept + 按源限速 → 先丢超额，再放行其余",
+			policy: mk("ap", model.ActionAccept, &model.RateLimit{Rate: 20, Per: "second", PerIP: true}),
+			inOrder: []string{
+				"add @limit_ap { ip saddr limit rate over 20/second } drop",
+				"accept",
+			},
+		},
+		{
+			name:    "drop + 按源限速 → 单条丢超额",
+			policy:  mk("dp", model.ActionDrop, &model.RateLimit{Rate: 20, Per: "second", PerIP: true}),
+			inOrder: []string{"add @limit_dp { ip saddr limit rate over 20/second } drop"},
+		},
+		{
+			name:   "accept + 并发限制 → 先丢超限，再放行其余",
+			policy: mk("ac", model.ActionAccept, &model.RateLimit{MaxConcurrent: 32}),
+			inOrder: []string{
+				"add @ctlimit_ac { ip saddr ct count over 32 } drop",
+				"accept",
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			res, err := Compile(c.policy, Options{HostMode: true, Counters: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := res.Snapshot.Render()
+
+			pos := 0
+			for _, want := range c.inOrder {
+				i := strings.Index(text[pos:], want)
+				if i < 0 {
+					t.Fatalf("缺少 %q（或顺序不对）:\n%s", want, text)
+				}
+				pos += i + len(want)
+			}
+			// 绝不能出现"把超额部分放行"这种反向写法
+			if strings.Contains(text, "limit rate over") && !strings.Contains(text, "drop") {
+				t.Errorf("over 限速后面必须跟 drop:\n%s", text)
+			}
+		})
+	}
+}
+
+// 按源限速 + accept 时，主规则上**不应**再挂 meter ——
+// 那会让它变成"只放行超额的那部分"。
+func TestPerIPAcceptDoesNotGateOnMeter(t *testing.T) {
+	p := &model.Policy{
+		Rules: []model.Rule{{
+			ID: "ap", SrcZone: model.ZoneAny, DstZone: model.ZoneLocal,
+			Proto: model.ProtoTCP, DstPort: []string{"22"}, Action: model.ActionAccept,
+			Limit: &model.RateLimit{Rate: 20, Per: "second", PerIP: true},
+		}},
+		Default: model.DefaultPolicy{Input: model.ActionDrop, Output: model.ActionAccept},
+	}
+	res, err := Compile(p, Options{HostMode: true, Counters: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := res.Snapshot.Table("inet", "fw").Chain("input")
+
+	var acceptRules, meterRules int
+	for _, r := range in.Rules {
+		if !strings.Contains(strings.Join(ruleFields(r), " "), "tcp dport 22") {
+			continue
+		}
+		hasMeter, hasAccept := false, false
+		for _, st := range r.Stmts {
+			if st.Kind == ir.StmtMeter {
+				hasMeter = true
+			}
+			if st.Kind == ir.StmtVerdict && st.Verdict == "accept" {
+				hasAccept = true
+			}
+		}
+		if hasAccept && hasMeter {
+			t.Errorf("放行规则上不应挂 meter（会变成只放行超额）: %s", res.Snapshot.Render())
+		}
+		if hasMeter {
+			meterRules++
+		}
+		if hasAccept {
+			acceptRules++
+		}
+	}
+	if meterRules != 1 || acceptRules != 1 {
+		t.Errorf("应恰好有一条丢超额的规则与一条放行规则，实际 meter=%d accept=%d:\n%s",
+			meterRules, acceptRules, res.Snapshot.Render())
+	}
+}
+
+// log + per_ip 必须被拒绝：按源限速只能表达"超额即丢弃"，
+// 会把纯记录规则变成丢弃规则。
+func TestLogWithPerIPLimitRejected(t *testing.T) {
+	p := &model.Policy{
+		Rules: []model.Rule{{
+			ID: "lg", SrcZone: model.ZoneAny, DstZone: model.ZoneLocal,
+			Action: model.ActionLog, Limit: &model.RateLimit{Rate: 10, Per: "second", PerIP: true},
+		}},
+	}
+	_, err := Compile(p, Options{HostMode: true})
+	if err == nil {
+		t.Fatal("log + per_ip 应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "per_ip") {
+		t.Errorf("错误信息应点明原因: %v", err)
+	}
+}
+
+// ruleFields 把规则的匹配条件渲染成可比较的字符串（测试用）。
+func ruleFields(r *ir.Rule) []string {
+	out := make([]string, 0, len(r.Matches))
+	for _, m := range r.Matches {
+		out = append(out, m.Field+" "+strings.Join(m.Values, ","))
+	}
+	return out
 }

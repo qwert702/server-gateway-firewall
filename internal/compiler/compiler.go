@@ -44,6 +44,16 @@ type Options struct {
 	// 理由见 buildChains 里的说明 —— 核心是避免与 Docker/firewalld 的链
 	// 在同一个钩子同一优先级上撞车（nft 里这种求值顺序是未定义的）。
 	HostMode bool
+	// InputPriority 覆盖 input/output 链的钩子优先级，0 表示用默认的 filter(0)。
+	//
+	// 用途是**叠加在已有防火墙之上**。实测（nft 1.0.9，网络命名空间）确认：
+	// 多条基础链挂同一钩子时按优先级依次执行，前一条链的 accept **不会**
+	// 阻止后一条链继续判定；而 drop 是终局。
+	//
+	// 所以把本工具挂在更高优先级（如 10）上，配合 default.input=accept、
+	// 只写明确的丢弃规则，就能做到"ufw 继续管放行，本工具叠加做封禁与限速"，
+	// 不必停用既有的防火墙 —— 既有防火墙往往还被面板之类的工具管着。
+	InputPriority int
 	// LogPrefix 为日志前缀，默认 "fw: "。
 	LogPrefix string
 
@@ -367,8 +377,9 @@ func (c *compiler) limitSets(want func(*model.Rule) bool, prefix string) []strin
 // ---- 链 ----
 
 func (c *compiler) buildChains(t *ir.Table) {
-	input := &ir.Chain{Name: "input", Type: ir.ChainFilter, Hook: ir.HookInput, Priority: ir.PrioFilter, Base: true, Policy: policyStr(c.policy.Default.Input, model.ActionDrop), Comment: "发往本机"}
-	output := &ir.Chain{Name: "output", Type: ir.ChainFilter, Hook: ir.HookOutput, Priority: ir.PrioFilter, Base: true, Policy: policyStr(c.policy.Default.Output, model.ActionAccept), Comment: "本机发出"}
+	prio := c.filterPriority()
+	input := &ir.Chain{Name: "input", Type: ir.ChainFilter, Hook: ir.HookInput, Priority: prio, Base: true, Policy: policyStr(c.policy.Default.Input, model.ActionDrop), Comment: "发往本机"}
+	output := &ir.Chain{Name: "output", Type: ir.ChainFilter, Hook: ir.HookOutput, Priority: prio, Base: true, Policy: policyStr(c.policy.Default.Output, model.ActionAccept), Comment: "本机发出"}
 
 	// 主机模式只注册 input / output 两条基础链。
 	//
@@ -642,7 +653,12 @@ func policyStr(a model.Action, def model.Action) string {
 
 // ---- 规则编译 ----
 
-// compileRule 把一条 model.Rule 展开为 1~N 条 ir.Rule（按地址族拆分）。
+// compileRule 把一条 model.Rule 展开为 1~N 条 ir.Rule。
+//
+// 展开的两种原因：
+//   - 按地址族拆分（见 splitByFamily）；
+//   - 按源限速且动作不是丢弃时，需要拆成"丢超额"+"放行其余"两条
+//     （见下面 limitStatements 的说明）。
 func (c *compiler) compileRule(chainName string, r *model.Rule) []*ir.Rule {
 	variants := c.splitByFamily(r)
 	var out []*ir.Rule
@@ -654,32 +670,30 @@ func (c *compiler) compileRule(chainName string, r *model.Rule) []*ir.Rule {
 			id = fmt.Sprintf("%s#%d", r.ID, i)
 		}
 
+		// 非丢弃动作的规则，需要先单独把"超额"的流量丢掉，再放行其余。
+		//
+		// nft 里 meter 与 ct count 都只有 "over" 一种极性（表达"超额"），
+		// 没有"按源、限内"的写法。所以对 accept/log 这类动作，
+		// 直接把限速语句挂在主规则上会变成"只放行超额的那部分"。
+		// 真机实测：单条 `add @S { ip saddr limit rate over 2/second } accept`
+		// 配 drop 默认策略，12 次连接一次都进不来。
+		//
+		// 每个条件单独成条，而不是把两个 add 塞进同一条 —— 那会变成「两个都超额」
+		// 才丢，而我们要的是「任一超额」就丢。
+		for _, excess := range c.excessDropRules(r) {
+			out = append(out, &ir.Rule{
+				ID:      chainName + "/" + id + "#over",
+				Matches: matches,
+				Stmts:   excess,
+				Comment: r.Comment + "（超出上限的丢弃）",
+			})
+		}
+
 		var stmts []ir.Statement
 		if r.HasCounter() {
 			stmts = append(stmts, ir.Statement{Kind: ir.StmtCounter})
 		}
-		// 限速与并发限制是两道独立的防线，可以同时配。
-		//
-		// 顺序：先按速率、再按并发数。两者都只是往动态集合里记一笔，
-		// 真正决定去向的是后面那条裁决语句。
-		if r.Limit != nil {
-			if r.Limit.PerIP && r.Limit.Rate > 0 {
-				stmts = append(stmts, ir.Statement{
-					Kind: ir.StmtMeter, SetName: rateLimitPrefix + sanitize(r.ID),
-					KeyField: "ip saddr", Rate: r.Limit.Rate, Per: limitUnit(r.Limit.Per), Over: true,
-				})
-			} else if r.Limit.Rate > 0 {
-				stmts = append(stmts, ir.Statement{
-					Kind: ir.StmtLimit, Rate: r.Limit.Rate, Per: limitUnit(r.Limit.Per), Burst: r.Limit.Burst,
-				})
-			}
-			if r.Limit.MaxConcurrent > 0 {
-				stmts = append(stmts, ir.Statement{
-					Kind: ir.StmtConnLimit, SetName: connLimitPrefix + sanitize(r.ID),
-					KeyField: "ip saddr", MaxConcurrent: r.Limit.MaxConcurrent,
-				})
-			}
-		}
+		stmts = append(stmts, c.limitStatements(r)...)
 		if r.Log || r.Action == model.ActionLog {
 			stmts = append(stmts, ir.Statement{Kind: ir.StmtLog, Prefix: logPrefix(c.opts.LogPrefix, r)})
 		}
@@ -695,6 +709,102 @@ func (c *compiler) compileRule(chainName string, r *model.Rule) []*ir.Rule {
 		})
 	}
 	return out
+}
+
+// excessDropRules 返回"丢弃超额流量"的辅助规则（每个条件一条）。
+//
+// nft 的 limit 有两种极性，用错会**正好相反**：
+//
+//	limit rate N/unit       —— 匹配"未超额"的包（用于 accept）
+//	limit rate over N/unit  —— 匹配"超额"的包（用于 drop）
+//
+// meter 与 ct count 都只有 over 这一种写法，所以对 accept / log 这类动作，
+// 必须先单独出一条"丢超额"的规则 —— 否则主规则会变成"只放行超额的那部分"。
+// 真机实测过：单条 `add @S { ip saddr limit rate over 2/second } accept`
+// 配 drop 默认策略，12 次连接**一次都进不来**，等于把服务打死。
+//
+// 动作本身就是丢弃时不需要辅助规则 —— 主规则自己就是"丢超额"。
+// 每个条件单独成条：塞进同一条会变成「都超额才丢」，而我们要的是「任一超额就丢」。
+func (c *compiler) excessDropRules(r *model.Rule) [][]ir.Statement {
+	if r.Limit == nil || isDropLike(r.Action) || r.Action == model.ActionLog {
+		return nil
+	}
+
+	withDrop := func(mid ir.Statement) []ir.Statement {
+		var st []ir.Statement
+		if r.HasCounter() {
+			st = append(st, ir.Statement{Kind: ir.StmtCounter})
+		}
+		return append(st, mid, ir.Statement{Kind: ir.StmtVerdict, Verdict: "drop"})
+	}
+
+	var out [][]ir.Statement
+	if r.Limit.PerIP && r.Limit.Rate > 0 {
+		out = append(out, withDrop(ir.Statement{
+			Kind:     ir.StmtMeter,
+			SetName:  rateLimitPrefix + sanitize(r.ID),
+			KeyField: "ip saddr",
+			Rate:     r.Limit.Rate,
+			Per:      limitUnit(r.Limit.Per),
+			Over:     true,
+		}))
+	}
+	if r.Limit.MaxConcurrent > 0 {
+		out = append(out, withDrop(ir.Statement{
+			Kind:          ir.StmtConnLimit,
+			SetName:       connLimitPrefix + sanitize(r.ID),
+			KeyField:      "ip saddr",
+			MaxConcurrent: r.Limit.MaxConcurrent,
+		}))
+	}
+	return out
+}
+
+// limitStatements 返回主规则上要带的限速 / 并发限制语句。
+//
+// 丢弃类动作：限速语句直接挂在主规则上（语义就是"超额即丢弃"）。
+// 非丢弃类：超额部分已由 excessDropRules 单独成条丢掉，主规则不再挂限速。
+func (c *compiler) limitStatements(r *model.Rule) []ir.Statement {
+	if r.Limit == nil {
+		return nil
+	}
+	var out []ir.Statement
+	dropLike := isDropLike(r.Action)
+
+	switch {
+	case r.Limit.PerIP && r.Limit.Rate > 0:
+		if dropLike {
+			out = append(out, ir.Statement{
+				Kind:     ir.StmtMeter,
+				SetName:  rateLimitPrefix + sanitize(r.ID),
+				KeyField: "ip saddr",
+				Rate:     r.Limit.Rate,
+				Per:      limitUnit(r.Limit.Per),
+				Over:     true,
+			})
+		}
+	case r.Limit.Rate > 0:
+		// 全局限速同样按动作选极性：accept 用"未超额"，drop 用"超额"。
+		out = append(out, ir.Statement{
+			Kind: ir.StmtLimit, Rate: r.Limit.Rate,
+			Per: limitUnit(r.Limit.Per), Burst: r.Limit.Burst, Over: dropLike,
+		})
+	}
+
+	if r.Limit.MaxConcurrent > 0 && dropLike {
+		out = append(out, ir.Statement{
+			Kind:          ir.StmtConnLimit,
+			SetName:       connLimitPrefix + sanitize(r.ID),
+			KeyField:      "ip saddr",
+			MaxConcurrent: r.Limit.MaxConcurrent,
+		})
+	}
+	return out
+}
+
+// isDropLike 报告该动作是否属于"丢弃"一类。
+func isDropLike(a model.Action) bool {
+	return a == model.ActionDrop || a == model.ActionReject
 }
 
 // ruleMatches 按固定顺序组装匹配条件，便于阅读与对账：
@@ -1015,4 +1125,20 @@ func zoneLabel(z string) string {
 		return model.ZoneAny
 	}
 	return z
+}
+
+// filterPriority 返回 input/output 链应使用的钩子优先级。
+//
+// 默认是 nft 的 filter(0)。设成更大的值（如 10）后，本工具的链会排在
+// ufw / iptables 的链**之后**执行，从而可以叠加在既有防火墙之上：
+// 既有防火墙继续管放行，本工具只管丢弃（封禁、限速）。
+//
+// 这依赖 nftables 的一条实测行为（nft 1.0.9）：同一钩子上的多条基础链
+// 按优先级依次执行，前一条链的 accept 不会阻止后一条链继续判定，
+// 而 drop 是终局。
+func (c *compiler) filterPriority() int {
+	if c.opts.InputPriority != 0 {
+		return c.opts.InputPriority
+	}
+	return ir.PrioFilter
 }

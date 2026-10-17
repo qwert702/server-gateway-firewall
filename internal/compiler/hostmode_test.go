@@ -174,3 +174,44 @@ func TestHostModeDefaultPolicies(t *testing.T) {
 		t.Errorf("output 默认策略应为 accept，实际 %q", got)
 	}
 }
+
+// 叠加模式：把 input 链放在更高优先级，使其在既有防火墙之后执行。
+//
+// 实测（nft 1.0.9）确认：同一钩子上的多条基础链按优先级依次执行，
+// 前一条链的 accept 不会阻止后一条链继续判定，而 drop 是终局。
+// 因此 fwdd 可以挂在 ufw 之上，只做"额外的丢弃"，不动既有放行规则。
+func TestLayeredModeUsesHigherPriority(t *testing.T) {
+	p := hostPolicy()
+	p.Default = model.DefaultPolicy{Input: model.ActionAccept, Output: model.ActionAccept}
+
+	res, err := Compile(p, Options{HostMode: true, InputPriority: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := res.Snapshot.Table("inet", "fw")
+	in, out := tbl.Chain("input"), tbl.Chain("output")
+	if in.Priority != 10 {
+		t.Errorf("input 链优先级应为 10，实际 %d", in.Priority)
+	}
+	if out.Priority != 10 {
+		t.Errorf("output 链优先级应为 10，实际 %d", out.Priority)
+	}
+	if in.Policy != "accept" {
+		t.Errorf("叠加模式下 input 默认策略应为 accept（放行交给既有防火墙），实际 %q", in.Policy)
+	}
+	// 渲染文本里要能看出优先级
+	if !strings.Contains(res.Snapshot.Render(), "hook input priority 10") {
+		t.Errorf("渲染结果里缺少 priority 10:\n%s", res.Snapshot.Render())
+	}
+}
+
+// 不设优先级时保持默认 filter(0)，不影响原有行为。
+func TestDefaultPriorityUnchanged(t *testing.T) {
+	res, err := Compile(hostPolicy(), Options{HostMode: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := res.Snapshot.Table("inet", "fw").Chain("input").Priority; p != 0 {
+		t.Errorf("默认优先级应为 0，实际 %d", p)
+	}
+}

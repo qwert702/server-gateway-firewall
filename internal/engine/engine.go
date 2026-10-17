@@ -148,6 +148,7 @@ func New(cfg config.Config, b backend.Backend, logger *slog.Logger, opts ...Opti
 			ConntrackFastPath: true,
 			Counters:          true,
 			HostMode:          cfg.IsHost(),
+			InputPriority:     cfg.InputPriority,
 		},
 		desired: &model.Policy{},
 	}

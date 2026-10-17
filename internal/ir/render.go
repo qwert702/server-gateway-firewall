@@ -194,7 +194,14 @@ func renderStatement(st Statement) string {
 		if per == "" {
 			per = "second"
 		}
-		s := fmt.Sprintf("limit rate %s/%s", humanRate(st.Rate), per)
+		// over 决定极性，用错会正好相反：
+		//   limit rate N/unit       匹配"未超额"的包（配 accept）
+		//   limit rate over N/unit  匹配"超额"的包（配 drop）
+		op := "rate"
+		if st.Over {
+			op = "rate over"
+		}
+		s := fmt.Sprintf("limit %s %s/%s", op, humanRate(st.Rate), per)
 		if st.Burst > 0 {
 			s += fmt.Sprintf(" burst %d packets", st.Burst)
 		}
