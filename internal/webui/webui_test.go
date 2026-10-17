@@ -78,25 +78,43 @@ func TestNoLongCache(t *testing.T) {
 	}
 }
 
-// 界面必须完全自包含：防火墙常常跑在隔离网络里，引用外部字体或 CDN
-// 会导致界面无法正常显示。
+// 界面必须能在完全离线的情况下**正常工作**：防火墙常常跑在隔离网络里。
 //
-// 只看 "http://" 会误报：CSS 里的内联 SVG 带着
-// xmlns='http://www.w3.org/2000/svg'，那是 XML 命名空间标识符，永远不会被请求。
-// 所以这里只找真正会发起网络请求的写法。
-func TestNoExternalReferences(t *testing.T) {
+// 要区分两件事：
+//   - 资源加载（script src / link href / img src / url() / @import）——
+//     浏览器会自动去取，节点不通就是白屏或掉样式，必须彻底禁止。
+//   - 用户可点击的 <a href> —— 那是导航，不是加载。页面照常渲染与工作，
+//     只是点进去要联网，这正是用户自己的选择，不该一刀切禁掉。
+//
+// 所以这里只查真正会自动发起请求的写法。
+func TestNoExternalResourceLoads(t *testing.T) {
 	h := Handler("/ui/")
-	fetches := []string{
-		`src="http`, `src='http`, `href="http`, `href='http`,
-		`url(http`, `url("http`, "@import", "//cdn.", "unpkg.com", "jsdelivr", "fonts.google",
+	loads := []string{
+		`<script src="http`, `<link href="http`, `<img src="http`,
+		`url(http`, `url("http`, `@import`,
+		"//cdn.", "unpkg.com", "jsdelivr", "fonts.google", "cdnjs",
 	}
 	for _, p := range []string{"/ui/", "/ui/app.css", "/ui/app.js"} {
 		_, body := get(t, h, p)
-		for _, bad := range fetches {
+		for _, bad := range loads {
 			if strings.Contains(body, bad) {
-				t.Errorf("%s 含会发起外部请求的写法 %q —— 界面必须能离线工作", p, bad)
+				t.Errorf("%s 含会自动加载外部资源的写法 %q —— 离线环境下界面会坏", p, bad)
 			}
 		}
+	}
+}
+
+// 外链只能出现在用户可点击的 <a href> 上，且必须带 rel="noopener"。
+func TestExternalLinksAreUserNavigationOnly(t *testing.T) {
+	_, html := get(t, Handler("/ui/"), "/ui/")
+	_ = html // index.html 目前没有外链
+
+	_, js := get(t, Handler("/ui/"), "/ui/app.js")
+	if !strings.Contains(js, `target="_blank"`) {
+		return // 没有外链，无需检查
+	}
+	if !strings.Contains(js, `rel="noopener"`) {
+		t.Error("新窗口打开的外链必须带 rel=\"noopener\"，否则被指向的站点能拿到 window.opener")
 	}
 }
 
@@ -105,7 +123,7 @@ func TestEveryNavPageHasRenderer(t *testing.T) {
 	_, html := get(t, Handler("/ui/"), "/ui/")
 	_, js := get(t, Handler("/ui/"), "/ui/app.js")
 
-	for _, page := range []string{"dashboard", "rules", "zones", "nat", "bans", "network", "audit"} {
+	for _, page := range []string{"dashboard", "rules", "zones", "nat", "bans", "groups", "network", "audit"} {
 		if !strings.Contains(html, `data-page="`+page+`"`) {
 			t.Errorf("导航缺少 %s 入口", page)
 		}

@@ -338,6 +338,25 @@ code, .code {
   color: var(--cyan);
 }
 
+/* 配置片段展示：给复制粘贴用，所以要能原样选中 */
+.code-block {
+  margin: 0;
+  padding: 12px 14px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line-hot);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--ink-dim);
+  overflow-x: auto;
+  white-space: pre;
+  tab-size: 2;
+}
+
+a { color: var(--cyan); text-decoration: none; border-bottom: 1px solid rgba(70,184,216,.35); }
+a:hover { border-bottom-color: var(--cyan); }
+
 /* ---------- 统计瓷片 ---------- */
 
 .tiles {
@@ -795,4 +814,12 @@ input::placeholder { color: var(--ink-faint); }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+/* 单元格内的次要说明（如规则引用哪个地址组） */
+.sub-note {
+  margin-top: 2px;
+  font-size: 10px;
+  color: var(--ink-faint);
+  letter-spacing: .03em;
 }

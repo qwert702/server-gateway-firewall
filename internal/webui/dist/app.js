@@ -119,6 +119,8 @@ const state = {
   status: null,
   plan: null,
   events: [],
+  // groups 是地址组摘要，规则表单的下拉需要它
+  groups: [],
   pendingTick: null,
   timer: null,
 };
@@ -239,6 +241,7 @@ const PAGES = {
   zones: { title: '安全域', render: viewZones },
   nat: { title: 'NAT', render: viewNAT },
   bans: { title: '封禁', render: viewBans },
+  groups: { title: '地址组', render: viewGroups },
   network: { title: '网络', render: viewNetwork },
   audit: { title: '审计', render: viewAudit },
 };
@@ -579,8 +582,14 @@ function offendersTable(off) {
    ============================================================ */
 
 async function viewRules(view) {
-  const [rulesResp, st] = await Promise.all([api.get('/rules'), api.get('/status')]);
+  const [rulesResp, st, gr] = await Promise.all([
+    api.get('/rules'),
+    api.get('/status'),
+    api.get('/groups').catch(() => ({ groups: [] })),
+  ]);
   paintChrome(st);
+  // 规则表单里的地址组下拉需要这份数据
+  state.groups = list(gr.groups);
   const rules = list(rulesResp.rules);
 
   if (!rules.length) {
@@ -595,7 +604,10 @@ async function viewRules(view) {
     <tr data-off="${r.enabled === false ? 1 : 0}">
       <td class="strong nowrap">${r.id}</td>
       <td>${r.priority}</td>
-      <td class="nowrap">${orDash(r.src_zone || 'any')} → ${orDash(r.dst_zone || 'any')}</td>
+      <td class="nowrap">${orDash(r.src_zone || 'any')} → ${orDash(r.dst_zone || 'any')}
+        ${raw(r.src_group || r.dst_group
+          ? `<div class="sub-note">${esc([r.src_group && '源组 ' + r.src_group, r.dst_group && '目的组 ' + r.dst_group].filter(Boolean).join(' · '))}</div>`
+          : '')}</td>
       <td>${orDash(r.proto || 'any')}</td>
       <td class="nowrap">${orDash(list(r.dst_port).join(','))}</td>
       <td class="nowrap">${orDash(list(r.state).join(','))}</td>
@@ -670,8 +682,26 @@ function ruleForm(r) {
       <div class="field"><label>源地址（可选）</label><input type="text" id="f_saddr" value="${list(r.src_addr).join(',')}" placeholder="10.0.0.0/8"></div>
       <div class="field"><label>目的地址（可选）</label><input type="text" id="f_daddr" value="${list(r.dst_addr).join(',')}" placeholder="192.168.20.10"></div>
     </div>
+    <div class="grid-2">
+      <div class="field"><label>源地址组（可选）</label><select id="f_sgroup">
+        ${raw(ruleGroupOptions(r.src_group))}
+      </select></div>
+      <div class="field"><label>目的地址组（可选）</label><select id="f_dgroup">
+        ${raw(ruleGroupOptions(r.dst_group))}
+      </select></div>
+    </div>
     <div class="field"><label>备注</label><input type="text" id="f_comment" value="${r.comment || ''}"></div>
-    <div class="field-hint">目的域填 <code>local</code> 表示防火墙本机（规则会进 input/output 链）。</div>`;
+    <div class="field-hint">
+      目的域填 <code>local</code> 表示防火墙本机（规则会进 input/output 链）。
+      地址组适合"几万条 CIDR"的列表（国家封锁等），会编译成 nft 区间集合。
+    </div>`;
+}
+
+/** 地址组下拉选项。加载失败时退化为只读输入，不阻断规则编辑。 */
+function ruleGroupOptions(current) {
+  const groups = (state.groups || []).map((g) =>
+    `<option value="${esc(g.name)}" ${current === g.name ? 'selected' : ''}>${esc(g.name)}（${g.total} 条）</option>`).join('');
+  return `<option value="" ${!current ? 'selected' : ''}>（不使用）</option>${groups}`;
 }
 
 function readRuleForm() {
@@ -687,6 +717,9 @@ function readRuleForm() {
     action: $('#f_action').value,
     comment: $('#f_comment').value.trim(),
   };
+  const sg = $('#f_sgroup'), dg = $('#f_dgroup');
+  if (sg && sg.value) out.src_group = sg.value;
+  if (dg && dg.value) out.dst_group = dg.value;
   const prio = parseInt($('#f_prio').value, 10);
   if (!Number.isNaN(prio)) out.priority = prio;
   return out;
@@ -1045,6 +1078,115 @@ async function viewBans(view) {
       render();
     };
   });
+}
+
+/* ============================================================
+   视图：地址组
+   ============================================================ */
+
+async function viewGroups(view) {
+  const [gr, st] = await Promise.all([api.get('/groups'), api.get('/status')]);
+  paintChrome(st);
+  const groups = list(gr.groups);
+
+  if (!groups.length) {
+    view.innerHTML = html`
+      <section class="sec">
+        <div class="empty">
+          <strong>还没有定义地址组</strong>
+          地址组用来承载"几万条 CIDR"这类列表：国家封锁、威胁情报订阅、大网段清单。
+        </div>
+      </section>
+      <section class="sec">
+        <div class="panel">
+          <div class="field-hint" style="margin-bottom:12px">
+            在策略文件的 <code>addr_groups</code> 里定义，规则用 <code>src_group</code> /
+            <code>dst_group</code> 引用：
+          </div>
+          <pre class="code-block">addr_groups:
+  - name: cn
+    file: /etc/fwdd/geoip/CN.cidr
+  - name: small
+    cidrs: [10.0.0.0/8, 192.168.0.0/16]
+
+rules:
+  - id: block-cn
+    src_zone: wan
+    src_group: cn
+    action: drop</pre>
+        </div>
+      </section>`;
+    return;
+  }
+
+  const total = groups.reduce((n, g) => n + g.total, 0);
+  const used = groups.filter((g) => list(g.used_by).length > 0).length;
+
+  const rows = groups.map((g) => {
+    const by = list(g.used_by);
+    return html`
+      <tr>
+        <td class="strong">${g.name}</td>
+        <td>${g.v4_count}</td>
+        <td>${g.v6_count}</td>
+        <td class="strong">${g.total}</td>
+        <td class="nowrap muted">${orDash(g.source)}</td>
+        <td>${raw(by.length
+          ? by.map((id) => `<span class="badge" data-t="plain">${esc(id)}</span>`).join(' ')
+          : '<span class="badge" data-t="off">未被引用</span>')}</td>
+      </tr>`;
+  }).join('');
+
+  view.innerHTML = html`
+    <section class="sec">
+      <div class="tiles">
+        <div class="tile"><span class="tile-label">地址组</span><span class="tile-value">${groups.length}</span>
+          <span class="tile-sub">${used} 个被规则引用</span></div>
+        <div class="tile"><span class="tile-label">地址条目</span><span class="tile-value">${total}</span>
+          <span class="tile-sub">编译进 nft 区间集合</span></div>
+      </div>
+    </section>
+
+    <section class="sec">
+      <div class="sec-head">
+        <h2 class="sec-title">已加载的地址组</h2>
+        <span class="sec-note">fwdd 每 30 分钟自动重读文件；内容变化只标记未同步，不会自行下发</span>
+      </div>
+      <div class="tbl-wrap">
+        <table class="tbl">
+          <thead><tr>
+            <th>名称</th><th>IPv4</th><th>IPv6</th><th>合计</th><th>来源</th><th>被引用</th>
+          </tr></thead>
+          <tbody>${raw(rows)}</tbody>
+        </table>
+      </div>
+      <div style="margin-top:14px">
+        <button class="btn" id="reloadGroups">重新读取文件</button>
+      </div>
+    </section>
+
+    <section class="sec">
+      <div class="banner" data-sev="info">
+        <span class="banner-icon">i</span>
+        <div><b>地址组编译成 nft 区间集合，不是铺进规则</b>
+        <div>几万条 CIDR 若内联进规则文本，规则集会直接爆炸。集合查找是 O(1)，
+        且同一条规则按地址族自动分成 IPv4 / IPv6 两条，各引用各自族的集合。</div>
+        <div style="margin-top:6px">国家列表可以从
+        <a href="https://www.ipdeny.com/ipblocks/" target="_blank" rel="noopener">ipdeny.com</a>
+        下载（格式就是"每行一个 CIDR"）。本工具只负责加载，不解析 GeoLite2 数据库。</div>
+        </div>
+      </div>
+    </section>`;
+
+  $('#reloadGroups').onclick = async () => {
+    const r = await guard(() => api.post('/groups/reload'));
+    if (r && r.changed) {
+      toast('地址组内容已变化', '需要执行「下发」才会生效', 'warn', 7000);
+    } else if (r) {
+      toast('地址组无变化', '', 'ok', 2000);
+    }
+    render();
+  };
 }
 
 /* ============================================================
