@@ -121,6 +121,8 @@ const state = {
   events: [],
   // groups 是地址组摘要，规则表单的下拉需要它
   groups: [],
+  // mode 是部署形态（gateway | host），决定界面上显示哪些页面
+  mode: 'gateway',
   pendingTick: null,
   timer: null,
 };
@@ -594,7 +596,9 @@ async function viewRules(view) {
 
   if (!rules.length) {
     view.innerHTML = html`
-      <div class="empty"><strong>还没有规则</strong>没有规则时，forward 链会落到默认策略</div>
+      <div class="empty"><strong>还没有规则</strong>${state.mode === 'host'
+        ? '没有规则时，所有入站流量会落到 input 链的默认策略'
+        : '没有规则时，forward 链会落到默认策略'}</div>
       <div style="margin-top:14px">${raw(addRuleBtn())}</div>`;
     bindAddRule();
     return;
@@ -624,7 +628,7 @@ async function viewRules(view) {
   view.innerHTML = html`
     <section class="sec">
       <div class="sec-head">
-        <h2 class="sec-title">转发与本机策略</h2>
+        <h2 class="sec-title">${state.mode === 'host' ? '本机策略' : '转发与本机策略'}</h2>
         <span class="sec-note">按优先级从小到大求值；越靠前越先匹配</span>
       </div>
       <div class="tbl-wrap">
@@ -1009,7 +1013,11 @@ async function viewBans(view) {
           <tbody>${raw(rows)}</tbody>
         </table></div>`
         : html`<div class="empty"><strong>当前没有被封禁的地址</strong></div>`)}
-      <div style="margin-top:14px"><button class="btn" id="addBan">+ 手工封禁</button></div>
+      <div style="margin-top:14px;display:flex;gap:8px;align-items:center">
+        <button class="btn" id="addBan">+ 手工封禁</button>
+        <button class="btn" id="exportBan">导出取证记录</button>
+        <span class="field-hint">导出的是历史记录（只增不删），不是上面的当前封禁列表。</span>
+      </div>
     </section>
 
     ${raw(be && be.enabled ? html`
@@ -1055,6 +1063,20 @@ async function viewBans(view) {
     toast('已封禁 ' + ip, '已立即写入内核集合并落库');
     render();
   }, '封禁');
+
+  $('#exportBan').onclick = async () => {
+    // 直接用浏览器下载：导出文件可能要交给别人，走浏览器的下载流程
+    // 会带上正确的文件名与编码。
+    const url = '/api/v1/bans/export?format=csv&since='
+      + encodeURIComponent(state.exportSince || '');
+    const a = document.createElement('a');
+    a.href = url + (api.token ? '&token=' + encodeURIComponent(api.token) : '');
+    a.download = 'fwdd-attack-events.csv';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast('已开始下载', '若浏览器没反应，用 fw ban export 从命令行导出', 'ok', 5000);
+  };
 
   const tg = $('#banToggle');
   if (tg) tg.onclick = async () => {
@@ -1418,6 +1440,43 @@ function refreshSoon() {
 }
 
 /* ============================================================
+   部署形态
+   ============================================================ */
+
+// applyMode 按部署形态收窄界面。
+//
+// 主机模式下安全域与 NAT 是**没有意义**的（没有转发、没有地址转换），
+// 留着它们只会让人以为可以配 —— 而编译器会直接拒绝那些规则。
+// 与其让人配完才被拒，不如根本不显示。
+function applyMode(mode) {
+  state.mode = mode || 'gateway';
+  const host = state.mode === 'host';
+
+  for (const page of ['zones', 'nat']) {
+    const link = document.querySelector(`#nav a[data-page="${page}"]`);
+    // 直接移出 DOM 而不是 display:none —— 导航编号是 CSS 计数器生成的，
+    // 而 display:none 的元素**照样参与计数**，隐藏后编号会留空档。
+    if (host && link) link.remove();
+  }
+  const label = $('#modeLabel');
+  if (label) label.textContent = host ? '主机型' : '网关型';
+
+  // 当前页若被隐藏了，退回总览
+  if (host && (state.page === 'zones' || state.page === 'nat')) {
+    location.hash = '#/dashboard';
+  }
+}
+
+async function loadMode() {
+  try {
+    const cfg = await api.get('/config');
+    applyMode(cfg.mode);
+  } catch {
+    applyMode('gateway'); // 拿不到配置就按默认形态显示
+  }
+}
+
+/* ============================================================
    刷新循环
    ============================================================ */
 
@@ -1454,6 +1513,7 @@ async function boot() {
   } catch (e) {
     if (e.needsToken) return showTokenGate();
   }
+  await loadMode();
   $('#tokenGate').hidden = true;
   connectSSE();
   await navigate();
@@ -1467,5 +1527,27 @@ async function boot() {
 
 document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
 
+// 启动失败时把错误显示出来，而不是留一个空白页面。
+//
+// 界面出错最糟的表现形式就是"什么都没显示" —— 你不知道是服务没起、
+// 网络不通、还是脚本挂了。这里至少把真实原因摆在屏幕上。
+function fatal(err) {
+  const view = document.getElementById('view');
+  if (!view) return;
+  view.innerHTML = html`
+    <div class="banner" data-sev="bad">
+      <span class="banner-icon">✕</span>
+      <div>
+        <b>界面加载失败</b>
+        <div>${err && err.message ? err.message : String(err)}</div>
+        <div style="margin-top:6px">若持续出现，请查看浏览器控制台的完整堆栈；
+        服务端是否在运行可用 <code>fw status</code> 确认。</div>
+      </div>
+    </div>`;
+}
+
+window.addEventListener('error', (e) => fatal(e.error || e.message));
+window.addEventListener('unhandledrejection', (e) => fatal(e.reason));
+
 startClock();
-boot();
+boot().catch(fatal);

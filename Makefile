@@ -21,6 +21,10 @@ LDFLAGS := -s -w \
 all: build
 
 ## build: 构建两个二进制到 bin/
+##
+## 注意：Web 界面资源是 go:embed 编译进二进制的。改完 internal/webui/dist 下的
+## 文件必须重新 build 才生效 —— 只跑 `go build ./...` 不会更新 bin/，
+## 浏览器会继续拿到旧界面，而且服务端没有任何提示。
 build:
 	@mkdir -p $(BINDIR)
 	go build -ldflags "$(LDFLAGS)" -o $(BINDIR)/fwdd ./cmd/fwdd

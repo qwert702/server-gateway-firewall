@@ -141,9 +141,14 @@ body::after {
   padding: 8px 0;
   overflow-y: auto;
   flex: 1;
+  /* 编号由计数器生成，而不是写死在 HTML 里：
+     主机模式下会隐藏「安全域」「NAT」两项，写死的编号会留下空档
+     （01 02 05 06…），看着像少加载了东西。 */
+  counter-reset: navkey;
 }
 
 .nav a {
+  counter-increment: navkey;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -161,12 +166,13 @@ body::after {
   background: var(--panel-3);
   border-left-color: var(--amber);
 }
-.nav-key {
+.nav a::before {
+  content: counter(navkey, decimal-leading-zero);
   font-size: 9.5px;
   color: var(--ink-faint);
   letter-spacing: .06em;
 }
-.nav a.active .nav-key { color: var(--amber); }
+.nav a.active::before { color: var(--amber); }
 
 .rail-foot {
   border-top: 1px solid var(--line);
