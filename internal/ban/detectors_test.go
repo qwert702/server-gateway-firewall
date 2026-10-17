@@ -383,3 +383,31 @@ func TestDetectorsReportNames(t *testing.T) {
 		t.Errorf("日志检测器名称错误: %q", got)
 	}
 }
+
+// fw-rate-limit 特征必须带 "fw: " 前缀，否则会命中机器上**任何**带 SRC= 的
+// nft/ufw 日志行 —— 装了 ufw 的机器上每个被拦下的扫描包都会被算成一次
+// 攻击事件，把"ufw 拦了一个包"和"这个 IP 在攻击"混为一谈。
+func TestNftPatternRequiresOurPrefix(t *testing.T) {
+	ps, err := CompilePatterns(DefaultLogPatterns())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 我们自己打的日志：应命中
+	ours := `kernel: fw: IN=eth0 OUT= MAC=00:11 SRC=203.0.113.5 DST=10.0.0.1 PROTO=TCP SPT=1 DPT=22`
+	if evs := MatchLine(ps, ours); len(evs) == 0 {
+		t.Errorf("本工具自己的限速日志应命中: %s", ours)
+	}
+
+	// ufw 的日志：**不应**命中（它没有 fw: 前缀）
+	ufw := `kernel: [UFW BLOCK] IN=eth0 OUT= MAC=00:11 SRC=198.51.100.7 DST=10.0.0.1 PROTO=TCP SPT=1 DPT=1234`
+	if evs := MatchLine(ps, ufw); len(evs) != 0 {
+		t.Errorf("ufw 的拦截日志不应被当成本工具的限速事件: %+v", evs)
+	}
+
+	// 其他工具打的带 SRC= 的日志同样不应命中
+	other := `kernel: iptables: DROP IN=eth0 SRC=192.0.2.5 DST=10.0.0.1`
+	if evs := MatchLine(ps, other); len(evs) != 0 {
+		t.Errorf("其他工具的日志不应命中: %+v", evs)
+	}
+}

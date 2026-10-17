@@ -61,9 +61,16 @@ func DefaultLogPatterns() []LogPattern {
 			Regex: `Invalid user \S+ from (\S+)`},
 		{Name: "ssh-max-attempts", Weight: 3,
 			Regex: `error: maximum authentication attempts exceeded for \S+ from (\S+)`},
-		// 本工具自己生成的限速日志：nft 的 log 语句会把五元组打进内核日志。
-		{Name: "nft-limit", Weight: 3,
-			Regex: `SRC=(\d{1,3}(?:\.\d{1,3}){3})`},
+		// 本工具自己生成的限速/记录日志。
+		//
+		// **必须带 "fw: " 前缀**。早先的写法只匹配 `SRC=(...)`，那会命中任何
+		// nft/ufw 的日志行 —— 装了 ufw 的机器上，每个被拦下的扫描包都会被算成
+		// 一次攻击事件，把"ufw 拦了一个包"和"这个 IP 在攻击"混为一谈。
+		{Name: "fw-rate-limit", Weight: 3,
+			Regex: `fw: .*SRC=(\d{1,3}(?:\.\d{1,3}){3})`},
+		// 如果确实希望"被 ufw 拦下的扫描包也计入攻击事件"，取消下面一行的注释。
+		// 注意它会把正常的误连（比如连错端口）也算进去。
+		// {Name: "ufw-block", Weight: 1, Regex: `\[UFW BLOCK\].*SRC=(\d{1,3}(?:\.\d{1,3}){3})`},
 	}
 }
 

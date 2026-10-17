@@ -163,6 +163,11 @@ EOF
 cat >"$WORK/config.yaml" <<EOF
 listen: ""
 socket: $WORK/fwdd.sock
+# ★ 必须把数据目录也隔离到临时目录。
+#   不设的话默认是 /var/lib/fwdd —— 测试跑完会在**真实机器**上留下
+#   一份测试策略，而正式部署时"数据库优先于策略文件"，
+#   于是启动时会加载测试用的转发规则。这个坑真机上踩过一次。
+data_dir: $WORK
 backend: nftables
 table: fw
 family: inet
