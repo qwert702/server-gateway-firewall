@@ -79,11 +79,21 @@ else
     info "$TOKEN_FILE 已存在，保留不动"
 fi
 
-# 把令牌写进配置（仅当配置里的 token 为空时）
-if grep -qE '^token:\s*(""|\x27\x27)?\s*$' "$CONFDIR/config.yaml"; then
-    token="$(cat "$TOKEN_FILE")"
-    sed -i "s#^token:.*#token: \"$token\"#" "$CONFDIR/config.yaml"
-    info "已把令牌写入 config.yaml"
+# 把令牌写进配置。
+#
+# 要处理"配置里根本没有 token 行"的情况 —— 手写的配置常常就没有这一行，
+# 而 token 为空等于**关闭认证**（只监听回环，但服务器上任何能访问 localhost
+# 的程序都能完全控制防火墙）。真机上正是这么漏过一次。
+if grep -q '^token:' "$CONFDIR/config.yaml"; then
+    sed -i "s#^token:.*#token: \"$(cat "$TOKEN_FILE")\"#" "$CONFDIR/config.yaml"
+else
+    printf '\ntoken: "%s"\n' "$(cat "$TOKEN_FILE")" >> "$CONFDIR/config.yaml"
+fi
+info "已把令牌写入 config.yaml"
+
+# 写完立刻自检：配置里确实有非空的 token，否则起点就错了。
+if ! grep -qE '^token:\s*"[^"]+"' "$CONFDIR/config.yaml"; then
+    die "config.yaml 里的 token 为空 —— API 将不校验认证，请手工检查"
 fi
 
 echo "== 安装 systemd 单元 =="
