@@ -234,7 +234,12 @@ func renderStatement(st Statement) string {
 			}
 			return "redirect"
 		case "snat", "dnat":
-			return st.NATKind + " to " + formatNATTarget(st.Addr, st.Port)
+			// inet 表里的 NAT 必须显式带地址族限定词（`dnat ip to ...` /
+			// `dnat ip6 to ...`），否则 nft 直接报
+			// "ip or ip6 must be specified with address for inet tables"
+			// 并拒绝**整个**规则集 —— 这个错误靠读文档推不出来，
+			// 是在真实 nft 上校验时才发现的。
+			return st.NATKind + " " + familyKeyword(st.Addr) + " to " + formatNATTarget(st.Addr, st.Port)
 		}
 		return ""
 	case StmtJump:
@@ -270,6 +275,20 @@ func humanRate(n int) string {
 		n = 1
 	}
 	return fmt.Sprintf("%d", n)
+}
+
+// familyKeyword 返回地址对应的 nft 地址族限定词。
+//
+// inet 表里同时存在 IPv4 与 IPv6，NAT 语句必须自己说明作用于哪一族。
+func familyKeyword(addr string) string {
+	host := addr
+	if _, ipnet, err := net.ParseCIDR(addr); err == nil {
+		host = ipnet.IP.String()
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		return "ip6"
+	}
+	return "ip"
 }
 
 // formatNATTarget 渲染 NAT 目标地址：IPv6 字面量需要方括号包裹。

@@ -153,25 +153,39 @@ func (c *compiler) buildSets(t *ir.Table) {
 	}
 	// 按源地址限速 / 限制并发连接数所需的动态集合。
 	//
-	// 两类各用一个集合：限速靠令牌桶（limit rate over），并发数靠 ct count，
-	// 是两种不同的内核机制，塞进同一个集合语义会打架。
+	// 两类各用一个集合，而且**标志不同**：
+	//   - 限速靠令牌桶（limit rate over），集合可以带 timeout 自动过期；
+	//   - 并发数靠 ct count，集合**不能**带 timeout —— 带上会被内核拒绝
+	//     （EOPNOTSUPP "Operation not supported"），这是 nft 1.0.4 实测结果，
+	//     也是 nft(8) 手册里给的标准写法（flags dynamic，无 timeout）。
+	// 之前两类共用一套标志，导致并发限制的规则让整个规则集被拒。
 	type dynSet struct {
 		name    string
+		flags   []string
 		timeout time.Duration
 		comment string
 	}
 	var sets []dynSet
 	for _, name := range c.perIPLimitSets() {
-		sets = append(sets, dynSet{name, time.Minute, "按源地址限速的动态集合"})
+		sets = append(sets, dynSet{
+			name:    name,
+			flags:   []string{"dynamic", "timeout"},
+			timeout: time.Minute,
+			comment: "按源地址限速的动态集合",
+		})
 	}
 	for _, name := range c.connLimitSets() {
-		sets = append(sets, dynSet{name, 10 * time.Minute, "按源地址限制并发连接数的动态集合"})
+		sets = append(sets, dynSet{
+			name:    name,
+			flags:   []string{"dynamic"},
+			comment: "按源地址限制并发连接数的动态集合（不能带 timeout）",
+		})
 	}
 	for _, s := range sets {
 		t.Sets = append(t.Sets, &ir.Set{
 			Name:    s.name,
 			KeyType: "ipv4_addr",
-			Flags:   []string{"dynamic", "timeout"},
+			Flags:   s.flags,
 			Timeout: s.timeout,
 			Comment: s.comment,
 		})

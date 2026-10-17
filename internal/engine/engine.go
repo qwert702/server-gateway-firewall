@@ -1155,9 +1155,15 @@ func (e *Engine) Status(ctx context.Context) *Status {
 		st.RuntimeErr = err.Error()
 	case rt != nil:
 		st.Runtime = rt
-		if rt.Hash != "" && appliedHash != "" {
-			st.InSync = rt.Hash == appliedHash && st.DesiredHash == appliedHash
-		}
+		// 注意：**不要**拿 rt.Hash 与 appliedHash 比较。
+		//
+		// rt.Hash 是 `nft list table` 读回来的文本的哈希，内核会把它重新
+		// 排版成自己的规范形式（缩进、集合元素的顺序、注释位置都不同），
+		// 与 fwdd 生成的文本逐字节比较永远不可能相等 —— 那样写会让
+		// InSync 恒为 false。之前就是这么写的，真机上一眼就看出问题。
+		//
+		// 内核文本哈希的用处是**两次读取之间**的比较：它变了说明有人
+		// 在 fwdd 之外改了内核规则（漂移），那是另一回事，留给对账逻辑。
 	}
 	return st
 }

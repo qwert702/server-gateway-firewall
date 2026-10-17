@@ -73,9 +73,24 @@ assert() {
 }
 
 require_root
-echo "== 构建 =="
-go build -o "$WORK/fwdd" ./cmd/fwdd
-go build -o "$WORK/fw" ./cmd/fw
+echo "== 准备二进制 =="
+# 允许直接用交叉编译好的二进制（部署机上没有 Go 工具链）：
+#   FWDD_BIN=/tmp/fwdd-bin sudo -E ./deploy/netns-test.sh
+if [ -n "${FWDD_BIN:-}" ]; then
+	[ -x "$FWDD_BIN/fwdd" ] || { echo "错误: $FWDD_BIN/fwdd 不存在或不可执行" >&2; exit 1; }
+	[ -x "$FWDD_BIN/fw" ] || { echo "错误: $FWDD_BIN/fw 不存在或不可执行" >&2; exit 1; }
+	install -m 0755 "$FWDD_BIN/fwdd" "$WORK/fwdd"
+	install -m 0755 "$FWDD_BIN/fw" "$WORK/fw"
+	echo "  使用现成的二进制: $FWDD_BIN"
+else
+	command -v go >/dev/null 2>&1 || {
+		echo "错误: 本机没有 go。请交叉编译后设置 FWDD_BIN 指向二进制所在目录。" >&2
+		exit 1
+	}
+	go build -o "$WORK/fwdd" ./cmd/fwdd
+	go build -o "$WORK/fw" ./cmd/fw
+	echo "  已在本机构建"
+fi
 
 echo "== 搭建拓扑 =="
 for ns in $NS_WAN $NS_FW $NS_LAN; do
@@ -158,15 +173,18 @@ commit_confirm:
   timeout: 15s
 EOF
 
-echo "== 启动 fwdd（commit-confirm 已启用，15 秒内不确认会自动回滚）=="
+echo "== 启动 fwdd（配置里开着 commit-confirm）=="
 ip netns exec $NS_FW "$WORK/fwdd" -config "$WORK/config.yaml" >"$WORK/fwdd.log" 2>&1 &
 sleep 2
 
 # 守护进程跑在命名空间里，CLI 需要从同一个命名空间访问套接字
 FW() { ip netns exec $NS_FW "$WORK/fw" -config "$WORK/config.yaml" "$@"; }
 
-echo "== 确认下发（否则会被自动回滚）=="
-FW confirm || echo "  （无待确认变更，继续）"
+# 启动时的下发刻意**不**进入 commit-confirm 窗口：本地策略文件是可信基线，
+# 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+# 所以这里 confirm 报"没有待确认的变更"是正常的，不是失败。
+echo "== 确认下发（启动下发不进入确认窗口，此处预期为空操作）=="
+FW confirm || true
 
 echo "== 验证策略 =="
 # 外网不能主动进内网

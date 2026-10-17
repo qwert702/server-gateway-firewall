@@ -200,10 +200,7 @@ func (b *Backend) SetAdd(ctx context.Context, set string, elems ...ir.Element) e
 	if len(elems) == 0 {
 		return nil
 	}
-	fam, ok := b.setFamily(set)
-	if !ok {
-		return fmt.Errorf("nftables: 集合 %q 不存在或类型未知", set)
-	}
+	// 用表族而不是从集合名猜族（见文件末尾 setFamily 处的说明）
 	var parts []string
 	for _, e := range elems {
 		item := e.Key
@@ -216,7 +213,7 @@ func (b *Backend) SetAdd(ctx context.Context, set string, elems ...ir.Element) e
 		parts = append(parts, item)
 	}
 	text := fmt.Sprintf("add element %s %s %s { %s }\n",
-		fam, b.tableName, set, strings.Join(parts, ", "))
+		b.family, b.tableName, set, strings.Join(parts, ", "))
 	return b.exec(ctx, b.header()+text, "添加集合元素")
 }
 
@@ -225,14 +222,10 @@ func (b *Backend) SetDel(ctx context.Context, set string, keys ...string) error 
 	if len(keys) == 0 {
 		return nil
 	}
-	fam, ok := b.setFamily(set)
-	if !ok {
-		return fmt.Errorf("nftables: 集合 %q 不存在或类型未知", set)
-	}
 	var quoted []string
 	quoted = append(quoted, keys...)
 	text := fmt.Sprintf("delete element %s %s %s { %s }\n",
-		fam, b.tableName, set, strings.Join(quoted, ", "))
+		b.family, b.tableName, set, strings.Join(quoted, ", "))
 	// 删除不存在的元素会报错，按需忽略。
 	if err := b.exec(ctx, b.header()+text, "删除集合元素"); err != nil && !isNotFound(err.Error()) {
 		return err
@@ -242,11 +235,7 @@ func (b *Backend) SetDel(ctx context.Context, set string, keys ...string) error 
 
 // SetList 实现 backend.Backend：列出集合当前元素，附带剩余超时。
 func (b *Backend) SetList(ctx context.Context, set string) ([]ir.Element, error) {
-	fam, ok := b.setFamily(set)
-	if !ok {
-		return nil, fmt.Errorf("nftables: 集合 %q 不存在或类型未知", set)
-	}
-	raw, errText, err := b.runner.Run(ctx, "", "-j", "list", "set", fam, b.tableName, set)
+	raw, errText, err := b.runner.Run(ctx, "", "-j", "list", "set", b.family, b.tableName, set)
 	if err != nil {
 		return nil, fmt.Errorf("读取集合 %s 失败: %s", set, firstNonEmpty(errText, err.Error()))
 	}
@@ -258,9 +247,19 @@ func (b *Backend) Close() error { return nil }
 
 // ---- 内部 ----
 
+// header 返回规则集文本的前导注释。
+//
+// **刻意不含时间戳。** 这段文本是管道给 `nft -f -` 的 stdin，人看不到；
+// 而它的内容又参与计算"期望状态哈希"与"已下发哈希" —— 一旦带上
+// time.Now()，两次计算跨过一秒哈希就不同，表现为：
+//
+//	fw status 永远显示未同步、每次 apply 都报"有变化"、
+//	Web 界面永久挂着未同步告警。
+//
+// 这与"封禁元素把剩余时长编译进快照"是同一类错误：把随时间变化的东西
+// 放进了要对账的产物里。
 func (b *Backend) header() string {
-	return fmt.Sprintf("# 由 fwdd 生成，请勿手工编辑\n# 生成时间: %s\n",
-		time.Now().Format(time.RFC3339))
+	return "# 由 fwdd 生成，请勿手工编辑\n"
 }
 
 func (b *Backend) checkTable(s *ir.Snapshot) error {
@@ -285,17 +284,18 @@ func (b *Backend) exec(ctx context.Context, text, what string) error {
 	return nil
 }
 
-// setFamily 依据集合名后缀推断地址族（banned4/geoip_us4 等）。
-func (b *Backend) setFamily(name string) (string, bool) {
-	switch {
-	case strings.HasSuffix(name, "4"):
-		return "ip", true
-	case strings.HasSuffix(name, "6"):
-		return "ip6", true
-	default:
-		return "", false
-	}
-}
+// func setFamily 曾用于"按集合名后缀推断地址族"（banned4 → ip），
+// 那是错的：**集合属于表，不属于地址族**。
+//
+// inet 表里的 ipv4_addr 集合，寻址方式是 `inet fw banned4`，
+// 而不是 `ip fw banned4` —— 后者会被 nft 拒绝：
+//
+//	Error: No such file or directory; did you mean table 'fw' in family inet?
+//
+// 元素本身的 v4/v6 语义由集合的 `type ipv4_addr` 决定，与表族无关。
+// 因此所有集合操作一律用后端配置的表族（b.family）。
+// 这个 bug 在真机 netns 测试中才暴露：mock 后端不校验族，
+// 伪造 runner 也只比对命令文本，单测一路绿灯。
 
 func hashOf(s string) string {
 	sum := sha256.Sum256([]byte(s))

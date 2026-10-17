@@ -320,7 +320,7 @@ func TestNATAppearsInRuleset(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(plan.Text, "dnat to 10.0.0.10:80") {
+	if !strings.Contains(plan.Text, "dnat ip to 10.0.0.10:80") {
 		t.Errorf("NAT 规则未出现在规则集中:\n%s", plan.Text)
 	}
 }

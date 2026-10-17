@@ -296,7 +296,7 @@ func TestRenderGolden(t *testing.T) {
 		`iifname "eth1" meta l4proto tcp tcp dport 22 counter limit rate 10/minute burst 20 packets accept`,
 		"reject with tcp reset",
 		"masquerade",
-		"dnat to 10.0.0.10:80",
+		"dnat ip to 10.0.0.10:80",
 		"chain postrouting {",
 		"type nat hook postrouting priority 100; policy accept;",
 	}
@@ -331,7 +331,7 @@ func TestRenderIPv6DNATBrackets(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := res.Snapshot.Render()
-	if !strings.Contains(text, "dnat to [2001:db8:20::10]:443") {
+	if !strings.Contains(text, "dnat ip6 to [2001:db8:20::10]:443") {
 		t.Errorf("IPv6 DNAT 目标必须用方括号包裹:\n%s", text)
 	}
 }
@@ -657,5 +657,115 @@ func TestSameFamilyKeepsBothConstraints(t *testing.T) {
 	text := res.Snapshot.Render()
 	if !strings.Contains(text, "ip saddr 10.0.0.0/8 ip daddr 192.168.20.0/24") {
 		t.Errorf("源与目的约束都应保留在同一条规则里:\n%s", text)
+	}
+}
+
+// ---- 以下三条是 2026-10-17 在真实 nft 1.0.4（Alibaba Cloud Linux 3 / kernel 5.10）
+// 上用 `nft -c -f` 校验后钉死的。都是靠读文档推不出来、只有真机能发现的东西。----
+
+// inet 表里的 NAT 必须显式带地址族限定词，否则 nft 报
+// "ip or ip6 must be specified with address for inet tables" 并拒绝**整个**规则集。
+func TestNATCarriesAddressFamilyKeyword(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		NATRules: []model.NATRule{
+			{ID: "v4", Kind: model.NATDNAT, Proto: model.ProtoTCP, SrcZone: "wan",
+				MatchPort: "8080", ToAddr: "192.168.20.10", ToPort: "80"},
+			{ID: "v6", Kind: model.NATDNAT, Proto: model.ProtoTCP, SrcZone: "wan",
+				MatchPort: "8443", ToAddr: "2001:db8::10", ToPort: "443"},
+			{ID: "s4", Kind: model.NATSNAT, Proto: model.ProtoTCP, OutZone: "wan", ToAddr: "203.0.113.1"},
+			{ID: "s6", Kind: model.NATSNAT, Proto: model.ProtoTCP, OutZone: "wan", ToAddr: "2001:db8::1"},
+		},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := res.Snapshot.Render()
+
+	for _, want := range []string{
+		"dnat ip to 192.168.20.10:80",
+		"dnat ip6 to [2001:db8::10]:443",
+		"snat ip to 203.0.113.1",
+		"snat ip6 to [2001:db8::1]",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("缺少 %q —— inet 表里不带地址族限定词的 NAT 会让整个规则集被 nft 拒绝:\n%s", want, text)
+		}
+	}
+	// 绝不能出现没有族限定词的裸形式
+	for _, bad := range []string{"dnat to ", "snat to "} {
+		if strings.Contains(text, bad) {
+			t.Errorf("出现了不带地址族限定词的 %q:\n%s", bad, text)
+		}
+	}
+}
+
+// 并发限制的集合**不能**带 timeout 标志。
+//
+// `flags dynamic,timeout` + `ct count over N` 会被内核以 EOPNOTSUPP
+// ("Operation not supported") 拒绝，连带整个规则集加载失败。
+// nft(8) 手册给的标准写法是 `flags dynamic;`（无 timeout）。
+// 限速（limit rate over）则相反，带上 timeout 是合法的。
+func TestConnLimitSetHasNoTimeoutFlag(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{
+			{ID: "cl", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoTCP,
+				DstPort: []string{"443"}, Action: model.ActionDrop,
+				Limit: &model.RateLimit{MaxConcurrent: 32}},
+			{ID: "rl", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoTCP,
+				DstPort: []string{"80"}, Action: model.ActionDrop,
+				Limit: &model.RateLimit{Rate: 10, Per: "second", PerIP: true}},
+		},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := res.Snapshot.Table("inet", "fw")
+
+	cl := tbl.Set("ctlimit_cl")
+	if cl == nil {
+		t.Fatal("缺少并发限制集合")
+	}
+	for _, f := range cl.Flags {
+		if f == "timeout" {
+			t.Errorf("并发限制集合不能带 timeout 标志，否则内核会拒绝整个规则集: %+v", cl.Flags)
+		}
+	}
+	if cl.Timeout != 0 {
+		t.Errorf("并发限制集合不应设 timeout 值: %s", cl.Timeout)
+	}
+
+	rl := tbl.Set("limit_rl")
+	if rl == nil {
+		t.Fatal("缺少限速集合")
+	}
+	hasTimeout := false
+	for _, f := range rl.Flags {
+		if f == "timeout" {
+			hasTimeout = true
+		}
+	}
+	if !hasTimeout {
+		t.Errorf("限速集合应当带 timeout 以自动清理过期条目: %+v", rl.Flags)
+	}
+
+	// 渲染结果里，ctlimit 集合的 flags 行只能是 dynamic
+	text := res.Snapshot.Render()
+	start := strings.Index(text, "set ctlimit_cl {")
+	if start < 0 {
+		t.Fatalf("渲染结果里找不到 ctlimit_cl 集合:\n%s", text)
+	}
+	seg := text[start:]
+	if i := strings.Index(seg, "}"); i > 0 {
+		seg = seg[:i]
+	}
+	for _, line := range strings.Split(seg, "\n") {
+		// 只看 flags 行，注释里出现的 "timeout" 字样不算
+		if strings.Contains(line, "flags") && strings.Contains(line, "timeout") {
+			t.Errorf("ctlimit 集合的 flags 里出现了 timeout:\n%s", line)
+		}
 	}
 }

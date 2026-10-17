@@ -133,7 +133,7 @@ func TestSetAddRendersTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := fr.last().stdin
-	want := `add element ip fw banned4 { 203.0.113.9 timeout 2h comment "ssh 爆破", 203.0.113.10 }`
+	want := `add element inet fw banned4 { 203.0.113.9 timeout 2h comment "ssh 爆破", 203.0.113.10 }`
 	if !strings.Contains(got, want) {
 		t.Errorf("集合注入渲染错误\n got: %s\nwant: %s", strings.TrimSpace(got), want)
 	}
@@ -147,19 +147,6 @@ func TestSetDelToleratesMissingElement(t *testing.T) {
 
 	if err := b.SetDel(context.Background(), "banned4", "203.0.113.9"); err != nil {
 		t.Errorf("删除不存在的元素应被忽略，实际报错: %v", err)
-	}
-}
-
-func TestSetFamilyInference(t *testing.T) {
-	b := New()
-	if fam, ok := b.setFamily("banned4"); !ok || fam != "ip" {
-		t.Errorf("banned4 应推断为 ip, 实际 %s/%v", fam, ok)
-	}
-	if fam, ok := b.setFamily("banned6"); !ok || fam != "ip6" {
-		t.Errorf("banned6 应推断为 ip6, 实际 %s/%v", fam, ok)
-	}
-	if _, ok := b.setFamily("weird"); ok {
-		t.Error("无法推断族名时应返回 false")
 	}
 }
 
@@ -212,3 +199,70 @@ func TestStateHandlesMissingTable(t *testing.T) {
 }
 
 var _ backend.Backend = (*Backend)(nil)
+
+// 集合属于**表**，不属于地址族。
+//
+// 曾经按集合名后缀推断族（banned4 → ip），在 inet 表上生成的
+// `add element ip fw banned4 {...}` 会被 nft 拒绝：
+//
+//	No such file or directory; did you mean table 'fw' in family inet?
+//
+// 结果是封禁在真机上完全不生效 —— 而且是静默的，日志里只有一行 nft 报错。
+// 这个 bug 只在真机 netns 测试里暴露过：mock 后端不校验族，
+// 伪造 runner 也只比对命令文本。
+func TestSetOperationsUseTableFamily(t *testing.T) {
+	cases := []struct {
+		family string
+		want   string
+	}{
+		{"inet", "inet fw banned4"}, // 最常用：inet 表同时覆盖 v4/v6
+		{"ip", "ip fw banned4"},     // 纯 v4 表
+		{"ip6", "ip6 fw banned4"},   // 纯 v6 表
+	}
+	for _, c := range cases {
+		fr := &fakeRunner{}
+		b := New(WithRunner(fr), WithTable(c.family, "fw"))
+
+		if err := b.SetAdd(context.Background(), "banned4", ir.Element{Key: "203.0.113.9"}); err != nil {
+			t.Fatalf("%s: SetAdd 失败: %v", c.family, err)
+		}
+		got := fr.last().stdin
+		if !strings.Contains(got, "add element "+c.want) {
+			t.Errorf("SetAdd 应使用表族 %s，实际:\n%s", c.family, got)
+		}
+
+		if err := b.SetDel(context.Background(), "banned4", "203.0.113.9"); err != nil {
+			t.Fatalf("%s: SetDel 失败: %v", c.family, err)
+		}
+		if got := fr.last().stdin; !strings.Contains(got, "delete element "+c.want) {
+			t.Errorf("SetDel 应使用表族 %s，实际:\n%s", c.family, got)
+		}
+	}
+}
+
+// Render 必须对同一份快照给出逐字节相同的结果。
+//
+// 这是同类错误的第二次出现（第一次是封禁元素把剩余时长编译进快照）：
+// 只要产物里有随时间变化的东西，对账哈希就会永远对不上，
+// 表现为 fw status 永远"未同步"、每次 apply 都报"有变化"。
+// 前一次是 header 里带了 time.Now()。
+func TestRenderIsDeterministicOverTime(t *testing.T) {
+	b := New(WithRunner(&fakeRunner{}))
+	snap := testSnapshot(t)
+	ctx := context.Background()
+
+	first, err := b.Render(ctx, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 跨过一秒再渲染一次 —— 时间戳类的非确定性会在这里暴露
+	time.Sleep(1100 * time.Millisecond)
+	second, err := b.Render(ctx, snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Errorf("同一快照两次渲染结果不同 —— 产物里混入了随时间变化的内容:\n--- 第一次 ---\n%s\n--- 第二次 ---\n%s",
+			first, second)
+	}
+}
