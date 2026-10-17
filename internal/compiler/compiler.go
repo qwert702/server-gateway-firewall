@@ -144,14 +144,29 @@ func (c *compiler) buildSets(t *ir.Table) {
 			Comment: "自动封禁（IPv6）",
 		})
 	}
-	// 按源地址限速所需的动态集合。
+	// 按源地址限速 / 限制并发连接数所需的动态集合。
+	//
+	// 两类各用一个集合：限速靠令牌桶（limit rate over），并发数靠 ct count，
+	// 是两种不同的内核机制，塞进同一个集合语义会打架。
+	type dynSet struct {
+		name    string
+		timeout time.Duration
+		comment string
+	}
+	var sets []dynSet
 	for _, name := range c.perIPLimitSets() {
+		sets = append(sets, dynSet{name, time.Minute, "按源地址限速的动态集合"})
+	}
+	for _, name := range c.connLimitSets() {
+		sets = append(sets, dynSet{name, 10 * time.Minute, "按源地址限制并发连接数的动态集合"})
+	}
+	for _, s := range sets {
 		t.Sets = append(t.Sets, &ir.Set{
-			Name:    name,
+			Name:    s.name,
 			KeyType: "ipv4_addr",
 			Flags:   []string{"dynamic", "timeout"},
-			Timeout: time.Minute,
-			Comment: "按源地址限速的动态集合",
+			Timeout: s.timeout,
+			Comment: s.comment,
 		})
 	}
 }
@@ -164,24 +179,40 @@ func BanSetFor(addr string, set4, set6 string) string {
 	return set4
 }
 
+// 限速与并发限制的集合名前缀。
+const (
+	rateLimitPrefix = "limit_"
+	connLimitPrefix = "ctlimit_"
+)
+
+// perIPLimitSets 返回需要按源地址限速的规则所对应的集合名。
 func (c *compiler) perIPLimitSets() []string {
+	return c.limitSets(func(r *model.Rule) bool {
+		return r.Limit != nil && r.Limit.PerIP && r.Limit.Rate > 0
+	}, rateLimitPrefix)
+}
+
+// connLimitSets 返回需要按源地址限制并发连接数的规则所对应的集合名。
+func (c *compiler) connLimitSets() []string {
+	return c.limitSets(func(r *model.Rule) bool {
+		return r.Limit != nil && r.Limit.MaxConcurrent > 0
+	}, connLimitPrefix)
+}
+
+func (c *compiler) limitSets(want func(*model.Rule) bool, prefix string) []string {
 	seen := map[string]bool{}
 	var out []string
-	add := func(r *model.Rule) {
-		if r.Limit == nil || !r.Limit.PerIP || !r.IsEnabled() {
-			return
-		}
-		name := "limit_" + sanitize(r.ID)
-		if name == "limit_" {
-			return
-		}
-		if !seen[name] {
-			seen[name] = true
-			out = append(out, name)
-		}
-	}
 	for i := range c.policy.Rules {
-		add(&c.policy.Rules[i])
+		r := &c.policy.Rules[i]
+		if !r.IsEnabled() || !want(r) {
+			continue
+		}
+		name := prefix + sanitize(r.ID)
+		if name == prefix || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
 	}
 	sort.Strings(out)
 	return out
@@ -436,15 +467,25 @@ func (c *compiler) compileRule(chainName string, r *model.Rule) []*ir.Rule {
 		if r.HasCounter() {
 			stmts = append(stmts, ir.Statement{Kind: ir.StmtCounter})
 		}
+		// 限速与并发限制是两道独立的防线，可以同时配。
+		//
+		// 顺序：先按速率、再按并发数。两者都只是往动态集合里记一笔，
+		// 真正决定去向的是后面那条裁决语句。
 		if r.Limit != nil {
-			if r.Limit.PerIP {
+			if r.Limit.PerIP && r.Limit.Rate > 0 {
 				stmts = append(stmts, ir.Statement{
-					Kind: ir.StmtMeter, SetName: "limit_" + sanitize(r.ID),
+					Kind: ir.StmtMeter, SetName: rateLimitPrefix + sanitize(r.ID),
 					KeyField: "ip saddr", Rate: r.Limit.Rate, Per: limitUnit(r.Limit.Per), Over: true,
 				})
-			} else {
+			} else if r.Limit.Rate > 0 {
 				stmts = append(stmts, ir.Statement{
 					Kind: ir.StmtLimit, Rate: r.Limit.Rate, Per: limitUnit(r.Limit.Per), Burst: r.Limit.Burst,
+				})
+			}
+			if r.Limit.MaxConcurrent > 0 {
+				stmts = append(stmts, ir.Statement{
+					Kind: ir.StmtConnLimit, SetName: connLimitPrefix + sanitize(r.ID),
+					KeyField: "ip saddr", MaxConcurrent: r.Limit.MaxConcurrent,
 				})
 			}
 		}

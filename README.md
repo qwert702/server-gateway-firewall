@@ -27,6 +27,7 @@
 | 转发开关等内核网络参数管理与检查 | ✅ |
 | 网络状态清点（接口 / 地址 / 路由 / 策略路由） | ✅ |
 | 接口与路由的**写入**（最易自锁，需 commit-confirm 兜底） | ⏳ |
+| 限速与抗 DDoS（令牌桶 + 单源并发连接数限制） | ✅ |
 | 自动封禁引擎（conntrack + 日志检测、递进惩罚、白名单） | ✅ |
 | 内嵌 Web 管理界面（零构建、可离线） | ✅ |
 | Prometheus 指标与 SSE 实时事件流 | ✅ |
@@ -130,6 +131,43 @@ sudo ./bin/fwdd -config /etc/fwdd/config.yaml -import-policy
 
 启动时的下发**不进入 commit-confirm 窗口**：本地策略文件是可信基线，
 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+
+---
+
+## 限速与抗 DDoS
+
+两道**独立**的防线，可以单独配，也可以一起配：
+
+| 参数 | 拦什么 | nft 实现 |
+| --- | --- | --- |
+| `limit.rate` + `per_ip` | 连接**建得太快**（洪泛） | `add @set { ip saddr limit rate over N/unit }` |
+| `limit.max_concurrent` | 连接**建得太多且不释放** | `add @set { ip saddr ct count over N }` |
+
+```yaml
+- id: wan-slowloris
+  src_zone: wan
+  dst_zone: dmz
+  proto: tcp
+  dst_port: ["80", "443"]
+  state: [new]
+  action: drop
+  limit:
+    rate: 30            # 每源每秒最多 30 个新连接
+    per: second
+    per_ip: true
+    max_concurrent: 64  # 每源最多 64 个并发连接
+```
+
+为什么两个都要：**慢速攻击（slowloris 一类）每秒只建几个连接，速率限制完全看不出来**，
+但并发连接数会一路涨上去。只配速率限制，挡不住这类攻击。
+
+`per_ip` 决定速率是按每个源地址分别计数（动态集合）还是全局计数（令牌桶）——
+抗洪泛要按源，限制某个服务的总吞吐则用全局。
+
+SYN 洪泛另有一层防护，走内核参数：`net.ipv4.tcp_syncookies=1` 已在默认基线里，
+用 `manage_sysctls: true` 或 `fw net sysctl apply` 打开。
+
+> **注意**：`ct count` 只对 tcp/udp 有意义，配置校验会拒绝在 ICMP 上使用它。
 
 ---
 

@@ -213,6 +213,17 @@ func renderStatement(st Statement) string {
 			op = "rate over"
 		}
 		return fmt.Sprintf("add @%s { %s limit %s %s/%s }", st.SetName, key, op, humanRate(st.Rate), per)
+	case StmtConnLimit:
+		// nft 里"按源地址限制并发连接数"的写法是往动态集合里 add 一条
+		// ct count 表达式：超过阈值的源会被记录进集合，随后的 drop 才生效。
+		key := st.KeyField
+		if key == "" {
+			key = "ip saddr"
+		}
+		if st.MaxConcurrent <= 0 {
+			return ""
+		}
+		return fmt.Sprintf("add @%s { %s ct count over %d }", st.SetName, key, st.MaxConcurrent)
 	case StmtNAT:
 		switch st.NATKind {
 		case "masquerade":

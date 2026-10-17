@@ -423,3 +423,149 @@ func TestDuplicateRulesDeduped(t *testing.T) {
 		t.Errorf("语义相同的规则应被去重，实际保留 %d 条", len(fwd.Rules))
 	}
 }
+
+// 并发连接数限制（ct count）与速率限制是两道独立的防线：
+// 速率拦"连接建得太快"，并发拦"建得太多且不释放"。慢速攻击每秒只建几个
+// 连接，速率限制完全看不出来，但并发数会一路涨上去。
+func TestConnLimitEmitsCtCount(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "slowloris", SrcZone: "wan", DstZone: model.ZoneLocal,
+			Proto: model.ProtoTCP, DstPort: []string{"443"}, State: []string{"new"},
+			Action: model.ActionDrop,
+			Limit:  &model.RateLimit{MaxConcurrent: 30},
+		}},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := res.Snapshot.Table("inet", "fw")
+
+	set := tbl.Set("ctlimit_slowloris")
+	if set == nil {
+		t.Fatalf("应生成并发限制的动态集合:\n%s", res.Snapshot.Render())
+	}
+	hasDynamic := false
+	for _, f := range set.Flags {
+		if f == "dynamic" {
+			hasDynamic = true
+		}
+	}
+	if !hasDynamic {
+		t.Errorf("并发限制集合必须是 dynamic: %+v", set.Flags)
+	}
+
+	text := res.Snapshot.Render()
+	want := "add @ctlimit_slowloris { ip saddr ct count over 30 }"
+	if !strings.Contains(text, want) {
+		t.Errorf("缺少 ct count 语句，期望包含 %q:\n%s", want, text)
+	}
+}
+
+// 只配并发限制、不配速率时不应凭空生成限速语句。
+func TestConnLimitWithoutRate(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "cl", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoTCP,
+			DstPort: []string{"80"}, Action: model.ActionDrop,
+			Limit: &model.RateLimit{MaxConcurrent: 10},
+		}},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := res.Snapshot.Render()
+	if strings.Contains(text, "limit rate") {
+		t.Errorf("未配置 rate 时不应生成限速语句:\n%s", text)
+	}
+	if !strings.Contains(text, "ct count over 10") {
+		t.Errorf("应生成 ct count:\n%s", text)
+	}
+}
+
+// 两者同时配置时必须都出现，且各自用各自的集合。
+func TestRateAndConnLimitTogether(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "both", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoTCP,
+			DstPort: []string{"80"}, Action: model.ActionDrop,
+			Limit: &model.RateLimit{Rate: 20, Per: "second", PerIP: true, MaxConcurrent: 50},
+		}},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := res.Snapshot.Table("inet", "fw")
+	if tbl.Set("limit_both") == nil {
+		t.Error("缺少限速集合")
+	}
+	if tbl.Set("ctlimit_both") == nil {
+		t.Error("缺少并发限制集合（两类限制不能共用一个集合）")
+	}
+	text := res.Snapshot.Render()
+	if !strings.Contains(text, "limit rate over 20/second") {
+		t.Errorf("缺少限速语句:\n%s", text)
+	}
+	if !strings.Contains(text, "ct count over 50") {
+		t.Errorf("缺少并发限制语句:\n%s", text)
+	}
+}
+
+// 并发连接数对 ICMP 没有意义，应在编译前就被拦下。
+func TestConnLimitRejectsNonTCP(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "bad", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoICMP,
+			Action: model.ActionDrop, Limit: &model.RateLimit{MaxConcurrent: 5},
+		}},
+	}
+	_, err := Compile(p, Options{})
+	if err == nil {
+		t.Fatal("对 ICMP 配置并发连接数限制应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "max_concurrent") {
+		t.Errorf("错误信息应点明是哪一项: %v", err)
+	}
+}
+
+// 一个既没有 rate 也没有 max_concurrent 的 limit 等于没有限速，应被拒绝。
+func TestEmptyLimitRejected(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "empty", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoTCP,
+			Action: model.ActionDrop, Limit: &model.RateLimit{},
+		}},
+	}
+	if _, err := Compile(p, Options{}); err == nil {
+		t.Fatal("空 limit 应被拒绝，否则是静默失效")
+	}
+}
+
+// 停用的规则不应产生任何集合，否则会留下永远不会被引用的空集合。
+func TestDisabledRuleProducesNoLimitSets(t *testing.T) {
+	off := false
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "off", SrcZone: "wan", DstZone: model.ZoneAny, Proto: model.ProtoTCP,
+			Action: model.ActionDrop, Enabled: &off,
+			Limit: &model.RateLimit{MaxConcurrent: 10, Rate: 5, PerIP: true},
+		}},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := res.Snapshot.Table("inet", "fw")
+	if tbl.Set("ctlimit_off") != nil || tbl.Set("limit_off") != nil {
+		t.Error("停用的规则不应生成限速集合")
+	}
+}

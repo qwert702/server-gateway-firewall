@@ -108,11 +108,23 @@ func (r *Rule) HasCounter() bool { return r.Counter == nil || *r.Counter }
 
 // RateLimit 描述限速参数，可用于单条规则或全局限速。
 type RateLimit struct {
-	Rate  int    `json:"rate" yaml:"rate"` // 单位时间内的包数
-	Per   string `json:"per" yaml:"per"`   // second | minute | hour | day
+	Rate  int    `json:"rate,omitempty" yaml:"rate,omitempty"` // 单位时间内的包数
+	Per   string `json:"per,omitempty" yaml:"per,omitempty"`   // second | minute | hour | day
 	Burst int    `json:"burst,omitempty" yaml:"burst,omitempty"`
 	// PerIP 为 true 时按源地址分别计数（nft 动态集合），否则全局计数。
 	PerIP bool `json:"per_ip,omitempty" yaml:"per_ip,omitempty"`
+
+	// MaxConcurrent 限制**单个源地址的并发连接数**（nft: ct count over N）。
+	//
+	// 与 Rate 是不同的防线：Rate 拦的是"连接建得太快"，MaxConcurrent 拦的是
+	// "连接建得太多且不释放"。慢速攻击（slowloris 一类）每秒只建几个连接，
+	// 速率限制看不出来，但并发数会一路涨上去。
+	MaxConcurrent int `json:"max_concurrent,omitempty" yaml:"max_concurrent,omitempty"`
+}
+
+// Empty 报告该限速是否什么都没配。
+func (r *RateLimit) Empty() bool {
+	return r == nil || (r.Rate <= 0 && r.MaxConcurrent <= 0)
 }
 
 // NATKind 为 NAT 类型。

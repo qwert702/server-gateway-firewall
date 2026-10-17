@@ -138,6 +138,7 @@ const (
 	StmtCounter    StmtKind = "counter"
 	StmtLimit      StmtKind = "limit"        // 全局令牌桶限速
 	StmtLimitPerIP StmtKind = "limit_per_ip" // 按源地址限速（动态集合）
+	StmtConnLimit  StmtKind = "conn_limit"   // 按源地址限制并发连接数（nft: ct count）
 	StmtNAT        StmtKind = "nat"
 	StmtJump       StmtKind = "jump"
 	StmtGoto       StmtKind = "goto"
@@ -161,6 +162,8 @@ type Statement struct {
 	KeyField string `json:"key_field,omitempty"` // 例如 "ip saddr"
 	SetName  string `json:"set_name,omitempty"`  // 动态集合名
 	Over     bool   `json:"over,omitempty"`      // limit rate over（超过即命中）
+	// ConnLimit 用：单个源地址允许的并发连接数。
+	MaxConcurrent int `json:"max_concurrent,omitempty"`
 	// NAT:
 	NATKind string `json:"nat_kind,omitempty"` // snat | dnat | masquerade | redirect
 	Addr    string `json:"addr,omitempty"`

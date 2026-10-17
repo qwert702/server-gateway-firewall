@@ -64,7 +64,11 @@ func goldenSnapshot(t *testing.T) *ir.Snapshot {
 	})
 }
 
-// banAndLimitSnapshot 覆盖按源地址限速（动态集合 + meter 语义）。
+// banAndLimitSnapshot 覆盖限速与并发限制（动态集合 + meter / ct count 语义）。
+//
+// 并发连接数限制用的是 `add @set { ip saddr ct count over N }` 这一构造，
+// 本地没有 nft 无法验证，因此特意放进这里 —— 在 Linux 上跑
+// `make verify-nft` 时会被 `nft -c` 真正校验到。
 func banAndLimitSnapshot(t *testing.T) *ir.Snapshot {
 	t.Helper()
 	p := &model.Policy{
@@ -76,10 +80,19 @@ func banAndLimitSnapshot(t *testing.T) *ir.Snapshot {
 			{ID: "global", Priority: 110, SrcZone: "wan", DstZone: "lan",
 				Proto: model.ProtoUDP, DstPort: []string{"53"}, Action: model.ActionAccept,
 				Limit: &model.RateLimit{Rate: 100, Per: "second", Burst: 200}},
-			{ID: "portrange", Priority: 120, SrcZone: "lan", DstZone: "wan",
+			// 慢速攻击防护：单源并发连接数上限
+			{ID: "connlimit", Priority: 120, SrcZone: "wan", DstZone: "lan",
+				Proto: model.ProtoTCP, DstPort: []string{"80", "443"}, State: []string{"new"},
+				Action: model.ActionDrop, Limit: &model.RateLimit{MaxConcurrent: 64}},
+			// 两道防线同时生效
+			{ID: "both", Priority: 130, SrcZone: "wan", DstZone: model.ZoneLocal,
+				Proto: model.ProtoTCP, DstPort: []string{"22"}, State: []string{"new"},
+				Action: model.ActionDrop,
+				Limit:  &model.RateLimit{Rate: 6, Per: "minute", PerIP: true, MaxConcurrent: 4}},
+			{ID: "portrange", Priority: 140, SrcZone: "lan", DstZone: "wan",
 				Proto: model.ProtoTCP, DstPort: []string{"32768-60999"}, Action: model.ActionAccept},
 		},
-		Default: model.DefaultPolicy{Forward: model.ActionDrop},
+		Default: model.DefaultPolicy{Forward: model.ActionDrop, Input: model.ActionDrop},
 	}
 	return build(t, p, compiler.Options{BanSet4: "banned4", BanSet6: "banned6", Counters: true})
 }

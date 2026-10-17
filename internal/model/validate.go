@@ -157,11 +157,24 @@ func (p *Policy) Validate() []Problem {
 			}
 		}
 		if r.Limit != nil {
-			if r.Limit.Rate <= 0 {
-				ps = append(ps, errf(where, "limit.rate 必须为正数"))
+			if r.Limit.Rate <= 0 && r.Limit.MaxConcurrent <= 0 {
+				ps = append(ps, errf(where, "limit 既没有 rate 也没有 max_concurrent，等于没有限速"))
 			}
-			if _, err := rateUnit(r.Limit.Per); err != nil {
-				ps = append(ps, errf(where, "limit.per %v", err))
+			if r.Limit.Rate < 0 {
+				ps = append(ps, errf(where, "limit.rate 不能为负"))
+			}
+			if r.Limit.MaxConcurrent < 0 {
+				ps = append(ps, errf(where, "limit.max_concurrent 不能为负"))
+			}
+			if r.Limit.Rate > 0 {
+				if _, err := rateUnit(r.Limit.Per); err != nil {
+					ps = append(ps, errf(where, "limit.per %v", err))
+				}
+			}
+			// ct count 只对建立连接的协议有意义：ICMP 没有"连接"可言。
+			if r.Limit.MaxConcurrent > 0 && !protoHasPorts(r.Proto) {
+				ps = append(ps, errf(where,
+					"limit.max_concurrent 需要协议为 tcp 或 udp（并发连接数对 %s 没有意义）", orAny(r.Proto)))
 			}
 		}
 	}

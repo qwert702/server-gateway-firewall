@@ -594,6 +594,7 @@ func parseRuleFlags(args []string) (model.Rule, error) {
 	per := fs.String("limit-per", "second", "限速单位：second|minute|hour|day")
 	burst := fs.Int("limit-burst", 0, "限速突发额度")
 	perIP := fs.Bool("limit-per-ip", false, "限速是否按源地址分别计数")
+	maxConn := fs.Int("limit-max-conn", 0, "单源并发连接数上限（拦慢速攻击）")
 	logIt := fs.Bool("log", false, "命中时记录日志")
 	comment := fs.String("comment", "", "备注")
 	if _, err := parseInterspersed(fs, args); err != nil {
@@ -621,8 +622,8 @@ func parseRuleFlags(args []string) (model.Rule, error) {
 	r.Reject = model.RejectMode(*reject)
 	r.Log = *logIt
 	r.Comment = *comment
-	if *rate > 0 {
-		r.Limit = &model.RateLimit{Rate: *rate, Per: *per, Burst: *burst, PerIP: *perIP}
+	if *rate > 0 || *maxConn > 0 {
+		r.Limit = &model.RateLimit{Rate: *rate, Per: *per, Burst: *burst, PerIP: *perIP, MaxConcurrent: *maxConn}
 	}
 	return r, nil
 }

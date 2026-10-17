@@ -70,6 +70,28 @@ rules:
     log_prefix: "fw-deny-wan-dmz: "
     comment: 记录其余外网到 DMZ 的尝试
 
+  # ---- 抗 DDoS：两道独立的防线 ----
+  #
+  # limit.rate       拦"连接建得太快"（令牌桶）
+  # limit.max_concurrent 拦"连接建得太多且不释放"（ct count）
+  #
+  # 慢速攻击（slowloris 一类）每秒只建几个连接，速率限制完全看不出来，
+  # 但并发连接数会一路涨上去 —— 所以这两个要一起配。
+  - id: wan-slowloris
+    priority: 260
+    src_zone: wan
+    dst_zone: dmz
+    proto: tcp
+    dst_port: ["80", "443"]
+    state: [new]
+    action: drop
+    limit:
+      rate: 30            # 每源每秒最多 30 个新连接
+      per: second
+      per_ip: true
+      max_concurrent: 64  # 每源最多 64 个并发连接
+    comment: 抗慢速攻击与新连接洪泛
+
   # ---- 本机管理面（务必保留，否则会把自己锁在门外）----
   - id: ssh-from-lan
     priority: 300
