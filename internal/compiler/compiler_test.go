@@ -569,3 +569,93 @@ func TestDisabledRuleProducesNoLimitSets(t *testing.T) {
 		t.Error("停用的规则不应生成限速集合")
 	}
 }
+
+// ---- 按地址族拆分必须是「交集」 ----
+//
+// 这是一条真实的安全 bug 的回归测试：早期实现把规则的约束按族拆成了
+// "源约束一条、目的约束一条"，两边的条件各自孤立，范围被放大。
+// 例如 "源 10.0.0.0/8 且 目的 2001:db8::/32" 会变成
+// "丢弃所有来自 10/8 的流量" 加 "丢弃所有去往 2001:db8::/32 的流量"。
+func TestCrossFamilyRuleIsUnsatisfiable(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "cross", SrcZone: "wan", DstZone: model.ZoneAny,
+			SrcAddr: []string{"10.0.0.0/8"},
+			DstAddr: []string{"2001:db8::/32"},
+			Action:  model.ActionDrop,
+		}},
+		Default: model.DefaultPolicy{Forward: model.ActionDrop},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fwd := res.Snapshot.Table("inet", "fw").Chain("forward")
+	for _, r := range fwd.Rules {
+		if strings.Contains(r.ID, "cross") {
+			t.Fatalf("不可满足的规则不应生成任何 nft 规则，否则范围会被放大:\n%s",
+				res.Snapshot.Render())
+		}
+	}
+	// 但要明确告诉用户它被跳过了，而不是静默丢弃。
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w.Message, "地址族") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("跳过的规则必须给出提示，实际 warnings=%+v", res.Warnings)
+	}
+}
+
+// 同一维内同时给出 v4 与 v6 是正常的（"这些网段中的任意一个"），
+// 拆成两条规则语义等价。
+func TestSameDimensionMixedFamiliesStillSplits(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "src", SrcZone: "wan", DstZone: model.ZoneAny,
+			SrcAddr: []string{"10.0.0.0/8", "2001:db8::/32"},
+			Action:  model.ActionDrop,
+		}},
+		Default: model.DefaultPolicy{Forward: model.ActionDrop},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fwd := res.Snapshot.Table("inet", "fw").Chain("forward")
+	var n int
+	for _, r := range fwd.Rules {
+		if strings.Contains(r.ID, "src") {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("同一维的混合地址族应拆成 2 条，实际 %d:\n%s", n, res.Snapshot.Render())
+	}
+}
+
+// 源与目的都是 v4（或都是 v6）时，拆分后必须仍然同时保留两边的约束。
+func TestSameFamilyKeepsBothConstraints(t *testing.T) {
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}},
+		Rules: []model.Rule{{
+			ID: "both", SrcZone: "wan", DstZone: model.ZoneAny,
+			SrcAddr: []string{"10.0.0.0/8"},
+			DstAddr: []string{"192.168.20.0/24"},
+			Action:  model.ActionDrop,
+		}},
+		Default: model.DefaultPolicy{Forward: model.ActionDrop},
+	}
+	res, err := Compile(p, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := res.Snapshot.Render()
+	if !strings.Contains(text, "ip saddr 10.0.0.0/8 ip daddr 192.168.20.0/24") {
+		t.Errorf("源与目的约束都应保留在同一条规则里:\n%s", text)
+	}
+}

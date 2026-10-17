@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"fwdd/internal/addrgroup"
 	"fwdd/internal/backend"
 	"fwdd/internal/compiler"
 	"fwdd/internal/config"
@@ -49,6 +50,10 @@ type Engine struct {
 	clock   func() time.Time
 	// db 为 nil 时表示不持久化（纯内存运行，重启即遗忘）。
 	db *store.DB
+
+	// groups 是已加载的地址组内容（按名索引），编译时交给编译器。
+	// 与 copts 分开存：copts 是配置派生的静态选项，地址组会随文件变化重新加载。
+	groups map[string]compiler.GroupData
 
 	desired  *model.Policy
 	applied  *model.Policy
@@ -152,7 +157,131 @@ func New(cfg config.Config, b backend.Backend, logger *slog.Logger, opts ...Opti
 }
 
 // Options 返回编译选项（供外部构造 dry-run 时复用）。
-func (e *Engine) Options() compiler.Options { return e.copts }
+func (e *Engine) Options() compiler.Options { return e.compilerOptions() }
+
+// compilerOptions 返回当前的编译选项，附带已加载的地址组。
+func (e *Engine) compilerOptions() compiler.Options {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	opts := e.copts
+	opts.Groups = e.groups
+	return opts
+}
+
+// loadGroupData 读取策略引用的地址组，返回可交给编译器的数据。
+//
+// 纯函数，不碰引擎状态 —— 因为调用方有的持锁（Update）、有的不持（Restore），
+// 在这里取锁会自死锁。
+//
+// 加载失败会让调用方直接失败：少了地址的封锁是静默失效 —— 规则集看起来
+// 完全正常，只是那些地址根本没被匹配到，比启动报错难查得多。
+func loadGroupData(p *model.Policy) (map[string]compiler.GroupData, error) {
+	if p == nil || len(p.AddrGroups) == 0 {
+		return nil, nil
+	}
+	tbl, err := addrgroup.Load(p.AddrGroups)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]compiler.GroupData, len(tbl))
+	for name, s := range tbl {
+		m[name] = compiler.GroupData{V4: s.V4, V6: s.V6}
+	}
+	return m, nil
+}
+
+// GroupInfo 是地址组的摘要，用于展示与排查。
+type GroupInfo struct {
+	Name    string `json:"name"`
+	Source  string `json:"source"`
+	V4Count int    `json:"v4_count"`
+	V6Count int    `json:"v6_count"`
+	Total   int    `json:"total"`
+	// UsedBy 引用该组的规则 id。
+	UsedBy []string `json:"used_by,omitempty"`
+}
+
+// Groups 返回已加载地址组的摘要。
+func (e *Engine) Groups() []GroupInfo {
+	e.mu.Lock()
+	groups := e.groups
+	var policy *model.Policy
+	if e.desired != nil {
+		policy = deepCopy(e.desired)
+	}
+	e.mu.Unlock()
+
+	if len(groups) == 0 {
+		return nil
+	}
+	used := map[string][]string{}
+	if policy != nil {
+		for _, r := range policy.Rules {
+			for _, name := range []string{r.SrcGroup, r.DstGroup} {
+				if name != "" {
+					used[name] = append(used[name], r.ID)
+				}
+			}
+		}
+	}
+	out := make([]GroupInfo, 0, len(groups))
+	for name, g := range groups {
+		src := "内联"
+		if policy != nil {
+			if def := policy.AddrGroupByName(name); def != nil && def.File != "" {
+				src = def.File
+			}
+		}
+		out = append(out, GroupInfo{
+			Name: name, Source: src,
+			V4Count: len(g.V4), V6Count: len(g.V6), Total: len(g.V4) + len(g.V6),
+			UsedBy: used[name],
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// ReloadGroups 重新读取地址组文件。
+//
+// 国家地址列表这类数据会定期更新，不该为此重启守护进程。
+// 这里只重新加载，**不自动下发** —— 与其余变更一致：期望状态变了，
+// 由人决定什么时候 apply。
+func (e *Engine) ReloadGroups(ctx context.Context) (changed bool, err error) {
+	p := e.Policy()
+	if len(p.AddrGroups) == 0 {
+		return false, nil
+	}
+	tbl, err := addrgroup.Load(p.AddrGroups)
+	if err != nil {
+		return false, err
+	}
+	next := make(map[string]compiler.GroupData, len(tbl))
+	for name, s := range tbl {
+		next[name] = compiler.GroupData{V4: s.V4, V6: s.V6}
+	}
+
+	// 先编译一次比较哈希：只有内容真的变了才替换，避免日志刷屏。
+	probe := e.compilerOptions()
+	probe.Groups = next
+	after, err := compiler.Compile(p, probe)
+	if err != nil {
+		return false, err
+	}
+	before, err := compiler.Compile(p, e.compilerOptions())
+	if err != nil {
+		return false, err
+	}
+	if after.Snapshot.Render() == before.Snapshot.Render() {
+		return false, nil
+	}
+
+	e.mu.Lock()
+	e.groups = next
+	e.mu.Unlock()
+	e.audit("groups.reload", "", fmt.Sprintf("地址组内容已变化，共 %d 组", len(next)))
+	return true, nil
+}
 
 // Backend 返回后端。
 func (e *Engine) Backend() backend.Backend { return e.backend }
@@ -254,8 +383,13 @@ func (e *Engine) Restore(ctx context.Context, baseline *model.Policy) (fromDB bo
 		if err != nil {
 			return false, err
 		}
+		groups, err := loadGroupData(np)
+		if err != nil {
+			return false, err
+		}
 		e.mu.Lock()
 		e.desired = np
+		e.groups = groups
 		e.mu.Unlock()
 		return false, nil
 	}
@@ -294,10 +428,15 @@ func (e *Engine) Restore(ctx context.Context, baseline *model.Policy) (fromDB bo
 		if err != nil {
 			return false, err
 		}
+		groups, err := loadGroupData(np)
+		if err != nil {
+			return false, fmt.Errorf("加载地址组失败: %w", err)
+		}
 
 		e.mu.Lock()
 		np.Bans = bans
 		e.desired = np
+		e.groups = groups
 		e.persistPolicyLocked()
 		e.mu.Unlock()
 
@@ -320,9 +459,14 @@ func (e *Engine) Restore(ctx context.Context, baseline *model.Policy) (fromDB bo
 
 	// 直接落状态而不是走 SetPolicy：后者会保留当前内存中的封禁列表，
 	// 而此刻要的正是刚刚从库里读出来的那一份。
+	groups, err := loadGroupData(np)
+	if err != nil {
+		return false, fmt.Errorf("加载地址组失败: %w", err)
+	}
 	e.mu.Lock()
 	np.Bans = bans
 	e.desired = np
+	e.groups = groups
 	e.mu.Unlock()
 
 	e.log.Info("已从数据库恢复期望状态",
@@ -366,9 +510,38 @@ func (e *Engine) pruneLoop(ctx context.Context, every time.Duration) {
 	}
 }
 
-// StartMaintenance 启动后台维护（过期封禁清理），随 ctx 结束而停止。
+// StartMaintenance 启动后台维护：过期封禁清理 + 地址组重新加载。
 func (e *Engine) StartMaintenance(ctx context.Context) {
 	go e.pruneLoop(ctx, 5*time.Minute)
+	go e.groupReloadLoop(ctx, 30*time.Minute)
+}
+
+// groupReloadLoop 周期性重新读取地址组文件。
+//
+// 国家地址列表、威胁情报订阅这类数据会定期更新，不该为此重启守护进程。
+// 重新加载后**不自动下发** —— 与其余变更一致：期望状态变了，由人决定
+// 什么时候 apply；界面上会显示"未同步"提醒。
+func (e *Engine) groupReloadLoop(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		return
+	}
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			changed, err := e.ReloadGroups(ctx)
+			if err != nil {
+				e.log.Warn("重新加载地址组失败，沿用上一次的内容", "err", err)
+				continue
+			}
+			if changed {
+				e.log.Warn("地址组内容已变化，需要重新下发才能生效（fw apply）")
+			}
+		}
+	}
 }
 
 // ---- 期望状态 ----
@@ -383,9 +556,14 @@ func (e *Engine) SetPolicy(p *model.Policy) error {
 	if err != nil {
 		return err
 	}
+	groups, err := loadGroupData(np)
+	if err != nil {
+		return err
+	}
 	e.mu.Lock()
 	np.Bans = append([]model.BanEntry(nil), e.desired.Bans...)
 	e.desired = np
+	e.groups = groups
 	e.persistPolicyLocked()
 	e.mu.Unlock()
 
@@ -428,7 +606,14 @@ func (e *Engine) Update(fn func(p *model.Policy) error) error {
 	if errs := model.Errors(next.Validate()); len(errs) > 0 {
 		return &compiler.ValidationError{Problems: errs}
 	}
+	// 地址组可能被这次修改改动了（新增组、换文件路径），重新加载。
+	// 这里已在锁内，用纯函数形式加载，不能再取一次锁。
+	groups, err := loadGroupData(next)
+	if err != nil {
+		return err
+	}
 	e.desired = next
+	e.groups = groups
 	e.persistPolicyLocked()
 	return nil
 }
@@ -531,7 +716,7 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	appliedHash := e.appliedHash
 	e.mu.Unlock()
 
-	res, err := compiler.Compile(desired, e.copts)
+	res, err := compiler.Compile(desired, e.compilerOptions())
 	if err != nil {
 		return nil, err
 	}
@@ -551,7 +736,7 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	for _, w := range res.Warnings {
 		p.Warnings = append(p.Warnings, Warning{Where: w.Where, Message: w.Message})
 	}
-	p.Diff = diffChains(applied, desired, e.copts)
+	p.Diff = diffChains(applied, desired, e.compilerOptions())
 	p.ChainDetails = describeSegments(res.Snapshot)
 	return p, nil
 }
@@ -597,7 +782,7 @@ func (e *Engine) Apply(ctx context.Context, opts ApplyOptions) (*ApplyResult, er
 	desired := deepCopy(e.desired)
 	e.mu.Unlock()
 
-	res, err := compiler.Compile(desired, e.copts)
+	res, err := compiler.Compile(desired, e.compilerOptions())
 	if err != nil {
 		return nil, err
 	}
@@ -854,7 +1039,7 @@ func (e *Engine) undo(ctx context.Context, target *model.Policy, targetValid boo
 }
 
 func (e *Engine) restore(ctx context.Context, target *model.Policy, note string) error {
-	res, err := compiler.Compile(target, e.copts)
+	res, err := compiler.Compile(target, e.compilerOptions())
 	if err != nil {
 		return fmt.Errorf("回滚目标无法编译: %w", err)
 	}
@@ -957,7 +1142,7 @@ func (e *Engine) Status(ctx context.Context) *Status {
 	}
 
 	// 期望状态哈希用于判断是否需要重新下发。
-	if res, err := compiler.Compile(desired, e.copts); err == nil {
+	if res, err := compiler.Compile(desired, e.compilerOptions()); err == nil {
 		if text, err := e.backend.Render(ctx, res.Snapshot); err == nil {
 			st.DesiredHash = hash(text)
 			st.InSync = st.DesiredHash == appliedHash

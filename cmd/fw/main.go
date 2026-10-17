@@ -71,6 +71,9 @@ const usage = `fw —— 服务器网关防火墙命令行
   fw net sysctl show               查看内核网络参数
   fw net sysctl apply [--dry-run]  按基线写入内核参数（仅 Linux，需 root）
 
+  fw groups                        列出地址组（国家封锁、威胁情报列表）
+  fw groups reload                 重新读取地址组文件（不自动下发）
+
 注意：zone/rule/nat 的改动只写入期望状态，需要 fw apply 才下发到内核。
 
 全局参数:
@@ -157,6 +160,8 @@ func run(args []string, out *os.File) error {
 		return cmdNAT(ctx, c, out, format, sub)
 	case "net":
 		return cmdNet(ctx, c, out, format, sub)
+	case "groups", "group":
+		return cmdGroups(ctx, c, out, format, sub)
 	case "ban":
 		return cmdBan(ctx, c, out, format, sub)
 	default:
@@ -1011,6 +1016,43 @@ func cmdBanOffenders(ctx context.Context, c *client.Client, out *os.File, format
 		}
 		fmt.Fprintf(w, "%s\t%d\t%d\t%d\t%s\t%s\n",
 			o.IP, o.Score, o.Events, o.Strikes, banned, orDash(strings.Join(o.Sources, ",")))
+	}
+	return w.Flush()
+}
+
+func cmdGroups(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	if len(args) > 0 && args[0] == "reload" {
+		var resp struct {
+			Changed bool   `json:"changed"`
+			Note    string `json:"note"`
+		}
+		if err := c.Post(ctx, "/groups/reload", nil, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "已重新读取地址组：%s\n", resp.Note)
+		return nil
+	}
+
+	var resp struct {
+		Groups []engine.GroupInfo `json:"groups"`
+	}
+	if err := c.Get(ctx, "/groups", &resp); err != nil {
+		return err
+	}
+	if format == "json" {
+		return printJSON(out, resp.Groups)
+	}
+	if len(resp.Groups) == 0 {
+		fmt.Fprintln(out, "（没有定义地址组）")
+		fmt.Fprintln(out, "地址组用来承载国家封锁、威胁情报这类几万条的 CIDR 列表；")
+		fmt.Fprintln(out, "在策略文件的 addr_groups 里定义，规则用 src_group / dst_group 引用。")
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "名称\tIPv4\tIPv6\t来源\t被引用")
+	for _, g := range resp.Groups {
+		fmt.Fprintf(w, "%s\t%d\t%d\t%s\t%s\n",
+			g.Name, g.V4Count, g.V6Count, orDash(g.Source), orDash(strings.Join(g.UsedBy, ",")))
 	}
 	return w.Flush()
 }

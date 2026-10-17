@@ -97,7 +97,32 @@ type Rule struct {
 	LogPrefix string     `json:"log_prefix,omitempty" yaml:"log_prefix,omitempty"`
 	Counter   *bool      `json:"counter,omitempty" yaml:"counter,omitempty"`
 	Limit     *RateLimit `json:"limit,omitempty" yaml:"limit,omitempty"`
-	Comment   string     `json:"comment,omitempty" yaml:"comment,omitempty"`
+
+	// SrcGroup / DstGroup 引用命名地址组（见 AddrGroup）。
+	//
+	// 用途是承载"几万条 CIDR"这类列表：国家封锁、威胁情报订阅、大网段清单。
+	// 这些地址**不能**写进规则的地址列表 —— 那会被内联进规则文本，几万条
+	// 会让规则集爆炸；地址组编译成 nft 区间集合，查找是 O(1)。
+	//
+	// 每条规则最多引用一个源组与一个目的组（要匹配多个组就写多条规则），
+	// 这样才不会有"组 × 组"的组合爆炸。
+	SrcGroup string `json:"src_group,omitempty" yaml:"src_group,omitempty"`
+	DstGroup string `json:"dst_group,omitempty" yaml:"dst_group,omitempty"`
+
+	Comment string `json:"comment,omitempty" yaml:"comment,omitempty"`
+}
+
+// AddrGroup 是一个命名地址组。
+//
+// 地址来源二选一：文件（每行一个 CIDR，`#` 开头为注释）或内联列表。
+// 文件形式是给"几万条"那种体量用的 —— 那不该出现在策略文件里。
+type AddrGroup struct {
+	Name string `json:"name" yaml:"name"`
+	// File 为 CIDR 列表文件路径。
+	File string `json:"file,omitempty" yaml:"file,omitempty"`
+	// CIDRs 为内联地址列表，适合少量地址。
+	CIDRs   []string `json:"cidrs,omitempty" yaml:"cidrs,omitempty"`
+	Comment string   `json:"comment,omitempty" yaml:"comment,omitempty"`
 }
 
 // IsEnabled 缺省为启用。
@@ -236,14 +261,28 @@ func (b BanSettings) WhitelistContains(addr string) bool {
 
 // Policy 是完整的期望状态。
 type Policy struct {
-	Version  int               `json:"version" yaml:"version"`
-	Zones    []Zone            `json:"zones" yaml:"zones"`
-	Rules    []Rule            `json:"rules" yaml:"rules"`
-	NATRules []NATRule         `json:"nat_rules,omitempty" yaml:"nat_rules,omitempty"`
-	Bans     []BanEntry        `json:"bans,omitempty" yaml:"bans,omitempty"`
-	Default  DefaultPolicy     `json:"default" yaml:"default"`
-	BanSet   BanSettings       `json:"ban_settings,omitempty" yaml:"ban_settings,omitempty"`
-	Meta     map[string]string `json:"meta,omitempty" yaml:"meta,omitempty"`
+	Version    int               `json:"version" yaml:"version"`
+	Zones      []Zone            `json:"zones" yaml:"zones"`
+	AddrGroups []AddrGroup       `json:"addr_groups,omitempty" yaml:"addr_groups,omitempty"`
+	Rules      []Rule            `json:"rules" yaml:"rules"`
+	NATRules   []NATRule         `json:"nat_rules,omitempty" yaml:"nat_rules,omitempty"`
+	Bans       []BanEntry        `json:"bans,omitempty" yaml:"bans,omitempty"`
+	Default    DefaultPolicy     `json:"default" yaml:"default"`
+	BanSet     BanSettings       `json:"ban_settings,omitempty" yaml:"ban_settings,omitempty"`
+	Meta       map[string]string `json:"meta,omitempty" yaml:"meta,omitempty"`
+}
+
+// AddrGroupByName 按名称查找地址组；返回 nil 表示不存在。
+func (p *Policy) AddrGroupByName(name string) *AddrGroup {
+	if name == "" {
+		return nil
+	}
+	for i := range p.AddrGroups {
+		if p.AddrGroups[i].Name == name {
+			return &p.AddrGroups[i]
+		}
+	}
+	return nil
 }
 
 // ZoneByName 按名称查找域；返回 nil 表示不存在。

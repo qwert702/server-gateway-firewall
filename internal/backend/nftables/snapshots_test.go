@@ -121,3 +121,34 @@ func v6Snapshot(t *testing.T) *ir.Snapshot {
 	}
 	return build(t, p, compiler.Options{BanSet4: "banned4", BanSet6: "banned6", Counters: true})
 }
+
+// addrGroupSnapshot 覆盖地址组编译出的区间集合。
+//
+// `flags interval` + CIDR 元素的写法本地无法验证，特意放进来，
+// 在 Linux 上跑 `make verify-nft` 时会被 `nft -c` 真正校验到。
+func addrGroupSnapshot(t *testing.T) *ir.Snapshot {
+	t.Helper()
+	p := &model.Policy{
+		Zones: []model.Zone{{Name: "wan", Interfaces: []string{"eth0"}}, {Name: "lan", Interfaces: []string{"eth1"}}},
+		AddrGroups: []model.AddrGroup{
+			{Name: "cn", CIDRs: []string{"1.0.1.0/24", "1.0.2.0/23", "2001:db8::/32"}},
+			{Name: "internal", CIDRs: []string{"10.0.0.0/8", "192.168.0.0/16"}},
+		},
+		Rules: []model.Rule{
+			{ID: "drop-cn", Priority: 100, SrcZone: "wan", DstZone: "lan",
+				SrcGroup: "cn", Action: model.ActionDrop},
+			{ID: "allow-to-internal", Priority: 110, SrcZone: "wan", DstZone: "lan",
+				DstGroup: "internal", Proto: model.ProtoTCP, DstPort: []string{"443"},
+				State: []string{"new"}, Action: model.ActionAccept},
+		},
+		Default: model.DefaultPolicy{Forward: model.ActionDrop},
+	}
+	return build(t, p, compiler.Options{
+		Groups: map[string]compiler.GroupData{
+			"cn":       {V4: []string{"1.0.1.0/24", "1.0.2.0/23"}, V6: []string{"2001:db8::/32"}},
+			"internal": {V4: []string{"10.0.0.0/8", "192.168.0.0/16"}},
+		},
+		ConntrackFastPath: true,
+		Counters:          true,
+	})
+}

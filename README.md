@@ -31,6 +31,7 @@
 | 自动封禁引擎（conntrack + 日志检测、递进惩罚、白名单） | ✅ |
 | 内嵌 Web 管理界面（零构建、可离线） | ✅ |
 | Prometheus 指标与 SSE 实时事件流 | ✅ |
+| 地址组（国家封锁 / 威胁情报列表 → nft 区间集合） | ✅ |
 | GeoIP 国家拦截、打包与测试矩阵 | ⏳ M7 |
 
 > 驱动真实 `nft` 的测试在无 nft 或非 root 环境下自动跳过，因此 `go test ./...`
@@ -131,6 +132,58 @@ sudo ./bin/fwdd -config /etc/fwdd/config.yaml -import-policy
 
 启动时的下发**不进入 commit-confirm 窗口**：本地策略文件是可信基线，
 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+
+---
+
+## 地址组（国家封锁、威胁情报列表）
+
+几万条 CIDR 的列表**不能**写进规则里 —— 那会被内联成规则文本，规则集直接爆炸。
+地址组把它们编译成 nft **区间集合**，查找 O(1)：
+
+```yaml
+addr_groups:
+  # 每行一个 CIDR，`#` 起注释，裸 IP 会补成 /32 或 /128
+  - name: cn
+    file: /etc/fwdd/geoip/CN.cidr
+  - name: threat-intel
+    file: /etc/fwdd/lists/threat.cidr
+  - name: small
+    cidrs: [10.0.0.0/8, 192.168.0.0/16]   # 少量地址用内联
+
+rules:
+  - id: block-cn
+    src_zone: wan
+    dst_zone: any
+    src_group: cn          # 也可以 dst_group
+    action: drop
+```
+
+编译结果：
+
+```
+set grp_cn4 { type ipv4_addr; flags interval; elements = { 1.0.1.0/24, ... } }
+set grp_cn6 { type ipv6_addr; flags interval; elements = { 2001:db8::/32 } }
+...
+iifname "eth0" ip saddr @grp_cn4 counter drop
+iifname "eth0" ip6 saddr @grp_cn6 counter drop
+```
+
+**关于国家列表从哪来**：本工具只负责加载 CIDR 列表，不解析 GeoLite2 数据库
+（那要引依赖，而且 MaxMind 的库有许可限制）。你可以从
+[ipdeny.com](https://www.ipdeny.com/ipblocks/) 直接下载 `cn-aggregated.zone`
+这类文件，或用 `mmdblookup` / 官方工具从 GeoLite2 导出。格式就是"每行一个 CIDR"。
+
+```bash
+fw groups                # 列出已加载的组：条目数、来源文件、被哪些规则引用
+fw groups reload         # 重新读取文件（不自动下发）
+```
+
+**列表更新不该要求重启**：`fwdd` 每 30 分钟自动重读一次地址组文件；发现内容变化时
+只更新期望状态并**标记为未同步**，由你决定什么时候 `apply` —— 与其余变更一致，
+没有任何东西会背着你改动内核。
+
+> 加载失败会让策略设置整个失败，而不是跳过那个组。少了地址的封锁是静默失效：
+> 规则集看起来完全正常，只是那些地址根本没被匹配到，比启动报错难查得多。
 
 ---
 
@@ -475,6 +528,7 @@ internal/client/     CLI 用的 API 客户端（Unix 套接字优先）
 internal/store/      SQLite 持久化（策略、封禁、审计、元数据）
 internal/netcfg/     内核网络参数与接口/路由清点（Linux 实现 + 其他平台桩）
 internal/ban/        自动封禁：检测器（conntrack/日志）+ 判罚引擎
+internal/addrgroup/  地址组加载（CIDR 列表 → 区间集合元素）
 internal/obs/        Prometheus 指标与进程内事件总线
 internal/webui/      Web 管理界面（go:embed 内嵌，无构建步骤）
 internal/config/     守护进程配置加载与校验
@@ -514,7 +568,7 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 - **M5（已完成）** 自动封禁：conntrack 与日志检测器、加权滑动窗口、
   递进惩罚、白名单、跟踪表上限、运行时开关。
 - **M6（已完成）** 内嵌 Web 管理界面、SSE 实时事件流、Prometheus 指标。
-- **M7** GeoIP 国家拦截、大集合性能优化、打包与 netns 端到端测试矩阵。
+- **M7** 大集合性能优化、打包与 netns 端到端测试矩阵。
 
 ---
 
@@ -523,5 +577,6 @@ make netns         # 网络命名空间端到端测试（需 Linux + root）
 - 网络配置目前只读：可以清点接口/地址/路由，可以管理内核参数，
   但**不能**写入接口地址或路由条目。
 - 未与既有 iptables 规则做共存策略；同一钩子上二者会按 priority 排序，接管前请确认。
-- GeoIP 与 conntrack 连接表浏览尚未实现。
+- 不解析 GeoLite2 数据库；国家列表请自行导出为 CIDR 文本（见「地址组」一节）。
+- conntrack 连接表浏览尚未实现。
 - 自动封禁的 conntrack 检测器需要 Linux；日志检测器在任何平台都能用。

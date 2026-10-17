@@ -114,6 +114,8 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET "+p+"/config", s.handleGetConfig)
 
+	s.mux.HandleFunc("GET "+p+"/groups", s.handleGroups)
+	s.mux.HandleFunc("POST "+p+"/groups/reload", s.handleReloadGroups)
 	s.mux.HandleFunc("GET "+p+"/net", s.handleNetState)
 	s.mux.HandleFunc("POST "+p+"/net/sysctls", s.handleSetSysctls)
 	s.mux.HandleFunc("/", s.handleNotFound)
@@ -376,6 +378,29 @@ func (s *Server) handleDeleteBan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"unbanned": ip})
+}
+
+// ---- 地址组 ----
+
+func (s *Server) handleGroups(w http.ResponseWriter, r *http.Request) {
+	groups := s.engine.Groups()
+	if groups == nil {
+		groups = []engine.GroupInfo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"groups": groups, "count": len(groups)})
+}
+
+// handleReloadGroups 重新读取地址组文件（国家列表会定期更新，不该为此重启）。
+func (s *Server) handleReloadGroups(w http.ResponseWriter, r *http.Request) {
+	changed, err := s.engine.ReloadGroups(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"changed": changed,
+		"note":    map[bool]string{true: "内容已变化，需要 apply 才生效", false: "内容无变化"}[changed],
+	})
 }
 
 // ---- 可观测性 ----

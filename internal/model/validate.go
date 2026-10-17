@@ -102,6 +102,45 @@ func (p *Policy) Validate() []Problem {
 		}
 	}
 
+	// 地址组
+	groupNames := map[string]bool{}
+	for i, g := range p.AddrGroups {
+		where := fmt.Sprintf("addr_groups[%d]", i)
+		if g.Name == "" {
+			ps = append(ps, errf(where, "地址组名为空"))
+			continue
+		}
+		if groupNames[g.Name] {
+			ps = append(ps, errf(where, "地址组名 %q 重复", g.Name))
+		}
+		groupNames[g.Name] = true
+		where = fmt.Sprintf("addr_groups[%s]", g.Name)
+
+		if g.File == "" && len(g.CIDRs) == 0 {
+			ps = append(ps, errf(where, "地址组既没有 file 也没有 cidrs，加载不到任何地址"))
+		}
+		if g.File != "" && len(g.CIDRs) > 0 {
+			// 两种来源同时给出时无法判断谁优先，直接拒绝而不是猜。
+			ps = append(ps, errf(where, "file 与 cidrs 只能二选一"))
+		}
+		for _, c := range g.CIDRs {
+			if _, _, err := net.ParseCIDR(c); err != nil {
+				if net.ParseIP(c) == nil {
+					ps = append(ps, errf(where, "地址 %q 非法的 IP 或 CIDR", c))
+				}
+			}
+		}
+	}
+
+	checkGroupRef := func(where, field, name string) {
+		if name == "" {
+			return
+		}
+		if !groupNames[name] {
+			ps = append(ps, errf(where, "%s 引用了未声明的地址组 %q", field, name))
+		}
+	}
+
 	// 规则
 	ruleIDs := map[string]bool{}
 	for i := range p.Rules {
@@ -116,6 +155,16 @@ func (p *Policy) Validate() []Problem {
 		}
 		checkZoneRef(where, "src_zone", r.SrcZone)
 		checkZoneRef(where, "dst_zone", r.DstZone)
+		checkGroupRef(where, "src_group", r.SrcGroup)
+		checkGroupRef(where, "dst_group", r.DstGroup)
+		if r.SrcGroup != "" && len(r.SrcAddr) > 0 {
+			ps = append(ps, warnf(where,
+				"同时指定了 src_addr 与 src_group，二者是「与」的关系（地址既要在列表里、也要在组里）"))
+		}
+		if r.DstGroup != "" && len(r.DstAddr) > 0 {
+			ps = append(ps, warnf(where,
+				"同时指定了 dst_addr 与 dst_group，二者是「与」的关系"))
+		}
 
 		if r.SrcZone == ZoneLocal && r.DstZone == ZoneLocal {
 			ps = append(ps, warnf(where, "src_zone 与 dst_zone 均为 local，规则只会匹配环回流量"))

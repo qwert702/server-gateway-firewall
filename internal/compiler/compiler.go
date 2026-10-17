@@ -41,6 +41,10 @@ type Options struct {
 	Counters bool
 	// LogPrefix 为日志前缀，默认 "fw: "。
 	LogPrefix string
+
+	// Groups 是已加载的地址组内容，按名称索引。规则引用未加载的组时
+	// 该规则的地址匹配会缺失，因此 engine 会在编译前确保引用的组都已加载。
+	Groups map[string]GroupData
 }
 
 func (o Options) withDefaults() Options {
@@ -91,6 +95,8 @@ func Compile(p *model.Policy, opts Options) (*Result, error) {
 	c.buildNAT(tbl)
 
 	snap := &ir.Snapshot{Tables: []*ir.Table{tbl}}
+	// 编译过程中产生的提示（例如规则因地址族互斥被跳过）与校验阶段的一起返回。
+	warns = append(warns, c.warnings...)
 	res := &Result{Snapshot: snap, Warnings: warns, ChainRules: map[string]int{}}
 	for _, ch := range tbl.Chains {
 		res.ChainRules[ch.Name] = len(ch.Rules)
@@ -113,9 +119,10 @@ func (e *ValidationError) Error() string {
 }
 
 type compiler struct {
-	policy *model.Policy
-	opts   Options
-	chains map[string]*ir.Chain
+	policy   *model.Policy
+	opts     Options
+	chains   map[string]*ir.Chain
+	warnings []model.Problem
 }
 
 // ---- 集合 ----
@@ -169,6 +176,67 @@ func (c *compiler) buildSets(t *ir.Table) {
 			Comment: s.comment,
 		})
 	}
+
+	// 地址组：只用区间集合承载，条目数可以到几万条。
+	//
+	// 必须用 interval 标志：IP 前缀在数值上是一段区间，不开 interval 时
+	// 内核只能做精确匹配，10.0.0.0/8 就只能匹配到 10.0.0.0 这一个地址。
+	for _, name := range c.referencedGroups() {
+		g := c.opts.Groups[name]
+		safe := sanitize(name)
+		if len(g.V4) > 0 {
+			t.Sets = append(t.Sets, &ir.Set{
+				Name:     groupSetPrefix + safe + "4",
+				KeyType:  "ipv4_addr",
+				Flags:    []string{"interval"},
+				Elements: toElements(g.V4),
+				Comment:  "地址组 " + name + "（IPv4）",
+			})
+		}
+		if len(g.V6) > 0 {
+			t.Sets = append(t.Sets, &ir.Set{
+				Name:     groupSetPrefix + safe + "6",
+				KeyType:  "ipv6_addr",
+				Flags:    []string{"interval"},
+				Elements: toElements(g.V6),
+				Comment:  "地址组 " + name + "（IPv6）",
+			})
+		}
+	}
+}
+
+func toElements(cidrs []string) []ir.Element {
+	out := make([]ir.Element, 0, len(cidrs))
+	for _, c := range cidrs {
+		out = append(out, ir.Element{Key: c})
+	}
+	return out
+}
+
+// referencedGroups 返回被启用的规则引用到的地址组名（已排序，保证输出稳定）。
+func (c *compiler) referencedGroups() []string {
+	seen := map[string]bool{}
+	for _, r := range c.policy.Rules {
+		if !r.IsEnabled() {
+			continue
+		}
+		for _, name := range []string{r.SrcGroup, r.DstGroup} {
+			if name == "" {
+				continue
+			}
+			// 未加载的组不声明集合：宁可少一个空集合，也不要生成一条
+			// 引用了不存在集合的规则（那会让整个规则集被内核拒绝）。
+			if _, ok := c.opts.Groups[name]; ok {
+				seen[name] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for name := range seen {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // BanSetFor 返回某个地址所属的封禁集合名（依据地址族）。
@@ -183,7 +251,17 @@ func BanSetFor(addr string, set4, set6 string) string {
 const (
 	rateLimitPrefix = "limit_"
 	connLimitPrefix = "ctlimit_"
+	groupSetPrefix  = "grp_"
 )
+
+// GroupData 是一个已加载地址组的内容（按地址族分开）。
+//
+// 编译器只认这个简单结构，不关心地址是从文件还是从 MMDB 来的 ——
+// 加载与解析是 internal/addrgroup 的事。
+type GroupData struct {
+	V4 []string `json:"v4,omitempty"`
+	V6 []string `json:"v6,omitempty"`
+}
 
 // perIPLimitSets 返回需要按源地址限速的规则所对应的集合名。
 func (c *compiler) perIPLimitSets() []string {
@@ -552,27 +630,26 @@ func (c *compiler) ruleMatches(r *model.Rule, addrs []ir.Match) []ir.Match {
 
 // splitByFamily 把规则中的地址按族拆分，必要时产生多条 ir.Rule 模板。
 // 返回的是"每一条变体需要追加的地址匹配"。
+// 地址族位掩码。0 表示"该维没有任何约束"（等价于两族都允许）。
+const (
+	fam4 = 1 << iota
+	fam6
+	famBoth = fam4 | fam6
+)
+
+// splitByFamily 把规则按地址族展开为若干条同义规则。
+//
+// 关键：这里做的是**交集**而不是并集。
+//
+// 一条规则里的所有匹配条件在语义上是「与」。如果把它按族拆成
+// "源约束一条、目的约束一条"，两边的条件就各自孤立了，范围被放大 ——
+// 例如 "源 10.0.0.0/8 且 目的 2001:db8::/32" 会变成
+// "丢弃所有来自 10/8 的流量" 加 "丢弃所有去往 2001:db8::/32 的流量"，
+// 这比原意宽得多；若动作是 accept，就是过度放行。
+//
+// 因此先算出每一维允许的族，取交集；交集为空说明该规则不可满足
+// （没有任何包能同时是 IPv4 和 IPv6），此时不生成规则并给出提示。
 func (c *compiler) splitByFamily(r *model.Rule) [][]ir.Match {
-	v4 := []ir.Match{}
-	v6 := []ir.Match{}
-
-	addAddrs := func(field4, field6 string, addrs []string) {
-		var a4, a6 []string
-		for _, a := range addrs {
-			if isV6(a) {
-				a6 = append(a6, a)
-			} else {
-				a4 = append(a4, a)
-			}
-		}
-		if len(a4) > 0 {
-			v4 = append(v4, ir.Match{Field: field4, Values: a4})
-		}
-		if len(a6) > 0 {
-			v6 = append(v6, ir.Match{Field: field6, Values: a6})
-		}
-	}
-
 	// 域的网段只在"该域未绑定接口"时才作为地址匹配使用：
 	// 域绑定接口时，接口已经界定了边界，再叠加网段会意外收窄匹配范围。
 	zoneAddrs := func(name string) []string {
@@ -582,19 +659,136 @@ func (c *compiler) splitByFamily(r *model.Rule) [][]ir.Match {
 		}
 		return z.Networks
 	}
-
-	addAddrs("ip saddr", "ip6 saddr", append(append([]string(nil), r.SrcAddr...), zoneAddrs(r.SrcZone)...))
-	addAddrs("ip daddr", "ip6 daddr", append(append([]string(nil), r.DstAddr...), zoneAddrs(r.DstZone)...))
-
-	switch {
-	case len(v4) > 0 && len(v6) > 0:
-		return [][]ir.Match{v4, v6}
-	case len(v6) > 0:
-		return [][]ir.Match{v6}
-	default:
-		// 无地址约束：单条规则（inet 表天然同时覆盖 v4/v6）。
-		return [][]ir.Match{v4}
+	splitAddrs := func(addrs []string) (a4, a6 []string) {
+		for _, a := range addrs {
+			if isV6(a) {
+				a6 = append(a6, a)
+			} else {
+				a4 = append(a4, a)
+			}
+		}
+		return a4, a6
 	}
+
+	src4, src6 := splitAddrs(append(append([]string(nil), r.SrcAddr...), zoneAddrs(r.SrcZone)...))
+	dst4, dst6 := splitAddrs(append(append([]string(nil), r.DstAddr...), zoneAddrs(r.DstZone)...))
+
+	srcAllows := famFromPresence(len(src4) > 0, len(src6) > 0)
+	dstAllows := famFromPresence(len(dst4) > 0, len(dst6) > 0)
+
+	// 地址组也参与族的判定：一个只有 IPv4 段的组，等于把规则限定在 IPv4。
+	srcG4, srcG6 := c.groupSetNames(r.SrcGroup)
+	dstG4, dstG6 := c.groupSetNames(r.DstGroup)
+	srcAllows = addFam(srcAllows, srcG4 != "", srcG6 != "")
+	dstAllows = addFam(dstAllows, dstG4 != "", dstG6 != "")
+
+	valid := srcAllows & dstAllows
+	if valid == 0 {
+		// 两维限定了互斥的地址族，规则不可满足。
+		id := r.ID
+		if id == "" {
+			id = "(匿名)"
+		}
+		c.warn("rules["+id+"]",
+			"源与目的分别限定了不同的地址族（如 IPv4 源 + IPv6 目的），没有任何包能满足，已跳过该规则")
+		return nil
+	}
+
+	var out [][]ir.Match
+	for _, f := range []struct {
+		bit int
+		v4  bool
+	}{
+		{fam4, true},
+		{fam6, false},
+	} {
+		if valid&f.bit == 0 {
+			continue
+		}
+		var m []ir.Match
+		if f.v4 {
+			if len(src4) > 0 {
+				m = append(m, ir.Match{Field: "ip saddr", Values: src4})
+			}
+			if srcG4 != "" {
+				m = append(m, ir.Match{Field: "ip saddr", Set: srcG4})
+			}
+			if len(dst4) > 0 {
+				m = append(m, ir.Match{Field: "ip daddr", Values: dst4})
+			}
+			if dstG4 != "" {
+				m = append(m, ir.Match{Field: "ip daddr", Set: dstG4})
+			}
+		} else {
+			if len(src6) > 0 {
+				m = append(m, ir.Match{Field: "ip6 saddr", Values: src6})
+			}
+			if srcG6 != "" {
+				m = append(m, ir.Match{Field: "ip6 saddr", Set: srcG6})
+			}
+			if len(dst6) > 0 {
+				m = append(m, ir.Match{Field: "ip6 daddr", Values: dst6})
+			}
+			if dstG6 != "" {
+				m = append(m, ir.Match{Field: "ip6 daddr", Set: dstG6})
+			}
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// addFam 把"某个族有组约束"并入已有的族掩码。
+//
+// 注意与 famFromPresence 的区别：这里是在已有限制上**追加**，而不是从零推导，
+// 所以没有组约束时保持原值不变。
+func addFam(mask int, has4, has6 bool) int {
+	if has4 {
+		mask |= fam4
+	}
+	if has6 {
+		mask |= fam6
+	}
+	return mask
+}
+
+// famFromPresence 依据"该维是否对某个族有约束"返回允许的族。
+// 完全没有约束时返回 famBoth —— 不限制就是两族都不限制。
+func famFromPresence(has4, has6 bool) int {
+	switch {
+	case has4 && has6:
+		return famBoth
+	case has4:
+		return fam4
+	case has6:
+		return fam6
+	default:
+		return famBoth
+	}
+}
+
+// groupSetNames 返回地址组在 v4/v6 两个族上对应的集合名；该族没有地址时返回空串。
+func (c *compiler) groupSetNames(name string) (set4, set6 string) {
+	if name == "" {
+		return "", ""
+	}
+	g, ok := c.opts.Groups[name]
+	if !ok {
+		return "", ""
+	}
+	safe := sanitize(name)
+	if len(g.V4) > 0 {
+		set4 = groupSetPrefix + safe + "4"
+	}
+	if len(g.V6) > 0 {
+		set6 = groupSetPrefix + safe + "6"
+	}
+	return set4, set6
+}
+
+// warn 记录一条编译期的非阻断提示。
+func (c *compiler) warn(where, msg string) {
+	c.warnings = append(c.warnings, model.Problem{Level: "warning", Where: where, Message: msg})
 }
 
 func verdict(r *model.Rule) ir.Statement {

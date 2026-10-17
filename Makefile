@@ -45,7 +45,14 @@ cross:
 	GOOS=linux GOARCH=arm64 go build -ldflags "$(LDFLAGS)" -o $(BINDIR)/fw-linux-arm64    ./cmd/fw
 
 ## verify-nft: 用真实 nft 校验生成的规则集语法（需 Linux + root，只校验不提交）
+##
+## 跑两部分：
+##   1. Go 侧的 golden 测试 —— 把编译器能生成的每一种构造（IPv6、按源限速、
+##      并发连接数限制、reject 模式、日志、NAT）逐个交给 `nft -c` 校验。
+##      这一层覆盖的是"示例策略恰好没用到"的边角构造。
+##   2. 脚本 —— 用真实示例策略走一遍完整下发与回滚。
 verify-nft:
+	sudo go test ./internal/backend/nftables/ -run 'Nft|Valid' -count=1 -v
 	sudo ./deploy/verify-ruleset.sh
 
 ## netns: 网络命名空间端到端测试（需 Linux + root）

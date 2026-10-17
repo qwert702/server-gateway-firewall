@@ -34,6 +34,7 @@ func TestGeneratedRulesetIsValidNft(t *testing.T) {
 		{"示例策略", goldenSnapshot(t)},
 		{"封禁与限速", banAndLimitSnapshot(t)},
 		{"IPv6", v6Snapshot(t)},
+		{"地址组", addrGroupSnapshot(t)},
 	}
 
 	for _, tc := range cases {

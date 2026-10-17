@@ -11,6 +11,27 @@
 
 version: 1
 
+# 地址组：承载"几万条 CIDR"这类列表（国家封锁、威胁情报订阅、大网段清单）。
+#
+# 这些地址不能写进规则的地址列表 —— 那会被内联进规则文本，几万条会让
+# 规则集爆炸；地址组编译成 nft 区间集合，查找是 O(1)。
+#
+# 文件格式：每行一个 CIDR 或 IP，`#` 起注释。
+# 国家列表可以从 ipdeny.com 下载（如 cn-aggregated.zone），或用官方工具
+# 从 GeoLite2 导出 —— 本工具只负责加载，不解析 MMDB。
+#
+# 规则用 src_group / dst_group 引用；fwdd 每 30 分钟自动重读文件，
+# 内容变化后只更新期望状态，由你决定何时 apply。
+addr_groups: []
+#  addr_groups:
+#    - name: cn
+#      file: /etc/fwdd/geoip/CN.cidr
+#      comment: 某国地址段
+#    - name: threat
+#      file: /etc/fwdd/lists/threat.cidr
+#    - name: small
+#      cidrs: [10.0.0.0/8, 192.168.0.0/16]   # 少量地址用内联
+
 zones:
   - name: wan
     interfaces: [eth0]
