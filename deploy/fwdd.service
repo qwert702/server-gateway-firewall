@@ -13,9 +13,18 @@ Restart=on-failure
 RestartSec=3
 
 # 需要操作 netfilter 与网络配置，因此保留 CAP_NET_ADMIN。
+#
+# ★ CAP_DAC_READ_SEARCH 是必须的：日志检测器要读 /var/log/auth.log，
+#   而那是 syslog:adm 拥有的 -rw-r----- 文件。CapabilityBoundingSet 一旦
+#   收窄，root 就**失去 CAP_DAC_OVERRIDE**，变成"受普通权限约束的 root"，
+#   读该文件会直接 permission denied。
+#
+#   这个坑很隐蔽：服务能正常启动、规则也能正常下发，只有日志检测器
+#   一声不吭地读不到东西。所以日志检测器现在会把读取失败报出来。
+#   真机上踩过一次。
 User=root
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
 
 # 收紧文件系统视图：只需要配置与运行时数据目录。
 ProtectSystem=strict

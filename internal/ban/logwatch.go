@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -119,9 +120,14 @@ type LogWatcher struct {
 	// FromEnd 为 true 时从文件末尾开始（默认），避免启动瞬间把历史日志
 	// 当成新事件而把整个日志里的人全封了。
 	FromEnd bool
+	// Logger 用于报告读取失败。**不要让它为 nil** ——
+	// 读不到日志时静默重试会让"检测器完全没工作"这件事毫无线索。
+	Logger *slog.Logger
 
 	offset int64
 	primed bool
+	// lastErr 记录上一次的错误，避免同一错误每秒刷屏。
+	lastErr string
 }
 
 // Name 实现 Detector。
@@ -141,8 +147,9 @@ func (w *LogWatcher) Run(ctx context.Context, out chan<- Event) error {
 
 	for {
 		if err := w.pollOnce(ctx, out); err != nil {
-			// 文件暂时不在（轮转间隙）属正常，继续等待。
-			_ = err
+			w.reportErr(err)
+		} else {
+			w.lastErr = ""
 		}
 		select {
 		case <-ctx.Done():
@@ -150,6 +157,26 @@ func (w *LogWatcher) Run(ctx context.Context, out chan<- Event) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// reportErr 报告一次读取失败，同一个错误只报一次。
+//
+// 原来这里是把错误直接丢掉的（`_ = err`），后果是**读不到日志时完全没有线索**：
+// 检测器一声不吭，界面上事件数永远是 0，看不出是"没有攻击"还是"没在工作"。
+// 在真实服务器上正是这么踩了一次 —— systemd 沙箱让读取失败，而日志里什么都没有。
+func (w *LogWatcher) reportErr(err error) {
+	msg := err.Error()
+	if msg == w.lastErr {
+		return
+	}
+	w.lastErr = msg
+	if w.Logger == nil {
+		return
+	}
+	w.Logger.Warn("日志检测器读取失败，将每秒重试",
+		"path", w.Path, "err", msg,
+		"提示", "检查文件是否存在、权限是否可读，以及 systemd 单元的沙箱设置"+
+			"（ProtectSystem=strict 下需要把该路径加进 ReadWritePaths）")
 }
 
 // PollOnce 读一次新增内容并产出事件。公开以便测试驱动。

@@ -373,7 +373,7 @@ func buildAutoBan(ctx context.Context, cfg config.Config, eng *engine.Engine, al
 		if err != nil {
 			return nil, fmt.Errorf("日志检测器 %s 配置无效: %w", ls.Path, err)
 		}
-		detectors = append(detectors, &ban.LogWatcher{Path: ls.Path, Patterns: compiled, FromEnd: true})
+		detectors = append(detectors, &ban.LogWatcher{Path: ls.Path, Patterns: compiled, FromEnd: true, Logger: logger})
 		logger.Info("已启用日志检测", "path", ls.Path, "特征数", len(compiled))
 	}
 
