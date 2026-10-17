@@ -147,6 +147,7 @@ func New(cfg config.Config, b backend.Backend, logger *slog.Logger, opts ...Opti
 			BanTimeout:        24 * time.Hour,
 			ConntrackFastPath: true,
 			Counters:          true,
+			HostMode:          cfg.IsHost(),
 		},
 		desired: &model.Policy{},
 	}
@@ -293,6 +294,12 @@ func (e *Engine) Store() *store.DB { return e.db }
 
 // persistTimeout 限制单次持久化耗时，避免磁盘异常时拖住整个管理接口。
 const persistTimeout = 5 * time.Second
+
+// attackEventRetention 是攻击取证记录的保留期。
+//
+// 90 天：足够覆盖"事发之后才想起来要查"的常见周期，又不会让库无限增长。
+// 一亿条记录也就几百 MB，但这个数字随攻击量走，所以必须有上限。
+const attackEventRetention = 90 * 24 * time.Hour
 
 // persistPolicyLocked 保存期望状态。调用方必须持有 e.mu。
 //
@@ -490,6 +497,12 @@ func (e *Engine) pruneLoop(ctx context.Context, every time.Duration) {
 			if err != nil {
 				e.log.Warn("清理过期封禁失败", "err", err)
 				continue
+			}
+			// 取证数据也要有保留期：留得住，但不能无限增长。
+			if cut, err := e.db.PruneBanEvents(ctx, e.clock().Add(-attackEventRetention)); err != nil {
+				e.log.Warn("清理过期攻击事件失败", "err", err)
+			} else if cut > 0 {
+				e.log.Info("已清理过期攻击事件", "count", cut, "保留期", attackEventRetention.String())
 			}
 			if n > 0 {
 				e.log.Info("已清理过期封禁", "count", n)
@@ -1188,6 +1201,28 @@ func (e *Engine) BanIP(ctx context.Context, ip, reason string, ttl time.Duration
 	})
 }
 
+// ---- 攻击取证 ----
+
+// RecordAttackEvent 追加一条攻击事件记录（用于取证与导出）。
+//
+// 写失败只记日志不返回错误：取证是旁路，不能因为它写不进去就影响封禁本身。
+func (e *Engine) RecordAttackEvent(ctx context.Context, ev store.BanEvent) {
+	if e.db == nil {
+		return
+	}
+	if err := e.db.AppendBanEvent(ctx, ev); err != nil {
+		e.log.Warn("写入攻击事件失败（不影响封禁本身）", "err", err, "ip", ev.IP)
+	}
+}
+
+// ListAttackEvents 返回攻击事件记录。
+func (e *Engine) ListAttackEvents(ctx context.Context, since time.Time, limit int) ([]store.BanEvent, error) {
+	if e.db == nil {
+		return nil, nil
+	}
+	return e.db.ListBanEvents(ctx, since, limit)
+}
+
 // OnUnban 注册解封回调。
 //
 // 用于通知自动封禁引擎清掉该地址的计数窗口 —— 否则手工解封后，
@@ -1235,6 +1270,19 @@ func (e *Engine) Ban(ctx context.Context, entry model.BanEntry) error {
 	e.persistBan(ctx, entry)
 	e.audit("ban.add", ip, entry.Reason)
 
+	// 取证记录只在手工封禁时写。
+	//
+	// 自动封禁走的是判罚引擎那条路，那里才有完整的决策细节
+	// （窗口内命中次数、第几次违规）—— 由 fwdd 的决策回调记录。
+	// 两边都写会重复，而这里写的缺 strikes/eventCount，反而不如不写。
+	if entry.Source != model.BanAuto {
+		e.RecordAttackEvent(ctx, store.BanEvent{
+			At: now, IP: ip, Action: "ban",
+			Source: string(entry.Source), Reason: entry.Reason,
+			TTL: entry.TTL(now),
+		})
+	}
+
 	// 立即注入内核，不必等到下一次 apply。
 	return e.backend.SetAdd(ctx, set, ir.Element{
 		Key: ip, Timeout: entry.TTL(now), Comment: entry.Reason,
@@ -1257,6 +1305,7 @@ func (e *Engine) Unban(ctx context.Context, ip string) error {
 	}
 	e.forgetBan(ctx, ip)
 	e.audit("ban.remove", ip, "")
+	e.RecordAttackEvent(ctx, store.BanEvent{IP: ip, Action: "unban"})
 
 	e.mu.Lock()
 	unbanHook := e.onUnban

@@ -29,6 +29,9 @@
 | 接口与路由的**写入**（最易自锁，需 commit-confirm 兜底） | ⏳ |
 | 限速与抗 DDoS（令牌桶 + 单源并发连接数限制） | ✅ |
 | 自动封禁引擎（conntrack + 日志检测、递进惩罚、白名单） | ✅ |
+| 主机模式（单机防护，不与 Docker/firewalld 冲突） | ✅ |
+| 告警推送（企业微信/钉钉/飞书/Telegram/邮件/脚本） | ✅ |
+| 攻击取证与 CSV/JSON 导出 | ✅ |
 | 内嵌 Web 管理界面（零构建、可离线） | ✅ |
 | Prometheus 指标与 SSE 实时事件流 | ✅ |
 | 地址组（国家封锁 / 威胁情报列表 → nft 区间集合） | ✅ |
@@ -160,6 +163,106 @@ sudo ./bin/fwdd -config /etc/fwdd/config.yaml -import-policy
 
 启动时的下发**不进入 commit-confirm 窗口**：本地策略文件是可信基线，
 无人值守重启若还要等确认，超时回滚会把防火墙规则整个撤掉。
+
+---
+
+## 主机模式：保护单台服务器
+
+fwdd 有两种部署形态，用配置里的 `mode` 选择：
+
+```yaml
+mode: host        # 主机型：只保护本机（单网卡服务器的正确选择）
+# mode: gateway   # 网关型：跨网段转发 + NAT（默认）
+```
+
+主机模式**只生成 `input` / `output` 两条链，不注册 `forward` 链与 `nat` 链**。
+
+这不是"少几条规则"这么简单。fwdd 的链优先级是 `filter(0)`，与 **Docker、firewalld 的链
+同钩子同优先级**，而 nftables 里这种情形的**求值顺序是未定义的**。网关模式会给 `forward`
+挂 `policy drop` —— 装在有 Docker 的机器上时，容器网络会不会被打断是**看运气**的，
+比确定会坏更难排查。主机模式不注册那条链，从根上没有这个问题。
+
+代价是主机模式下**引用 forward 的规则与 NAT 规则会被直接拒绝**（而不是静默丢弃）：
+
+```
+rules[gw-rule]: 主机模式没有 forward 链，这条规则（wan → lan）无处可落。
+只保护本机的规则请把其中一侧设为 zone "local"；真要做网关请把 mode 设为 gateway
+```
+
+内核参数基线也按模式分开（`netcfg.HostBaseline`）：主机模式**不含 `ip_forward`**，
+且 **`rp_filter=1`** —— 网关基线的 `rp_filter=0` 是为多宿主/非对称路由准备的，
+在单机上等于主动关掉内核自带的反欺骗。
+
+配套示例：`configs/policy.host.example.yaml`。
+
+```bash
+# 先看一遍将要写入内核的东西
+fwdd -mode host -policy /etc/fwdd/policy.yaml -dry-run | less
+```
+
+---
+
+## 告警推送
+
+不想盯着浏览器才被通知，就配 `alerts`：
+
+```yaml
+alert_cooldown: 5m
+
+alerts:
+  - {type: webhook, format: wecom, url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=..."}
+  - {type: webhook, format: telegram, chat_id: "123456", url: "https://api.telegram.org/bot<token>/sendMessage"}
+  - type: smtp
+    addr: smtp.qq.com:465
+    implicit_tls: true
+    username: you@qq.com
+    password: "授权码"
+    from: you@qq.com
+    to: [you@qq.com]
+    min_severity: warn
+```
+
+`format` 支持 `wecom` / `dingtalk` / `feishu` / `telegram` / `generic`——
+一份 Webhook 实现加格式适配，不必为每家机器人写一个通道。`generic` 发结构化 JSON
+给自建系统；`command` 通道执行本地脚本兜底，事件内容**只走环境变量与 stdin，不拼进命令行**
+（那些内容来自外部输入）。
+
+**告警本身不能变成新的洪水源。** 一次端口扫描能瞬间产生几十条封禁，逐条推送会把你淹没，
+然后你就开始忽略它们 —— 那比没有告警更糟。所以有两层收敛：同一事件（类型 + IP）在
+`alert_cooldown` 内只发一次并合并计数；投递在后台队列里做且**永不阻塞** ——
+它跑在封禁决策的路径上，一个卡住的 webhook 不能让防火墙失去响应。
+
+```bash
+fw alert            # 通道状态、已发送/已合并/已丢弃计数
+fw alert test       # 立刻发一条测试告警并等待结果
+```
+
+配置完**先跑 `fw alert test`** —— 不要等真被攻击时才发现 webhook 地址写错了。
+
+---
+
+## 攻击取证与导出
+
+封禁记录和取证记录是两回事，分开存：
+
+| | 内容 | 生命周期 |
+| --- | --- | --- |
+| `ban_entries` | 当前封着谁 | 解封/过期即删除 |
+| `ban_events` | 曾经发生过什么 | 只增不删，保留 90 天 |
+
+导出给云厂商或 CERT 投诉时要的是后者 —— "某 IP 在什么时间以什么检测源打了多少次、
+第几次违规、封了多久"才是能用的证据；封禁记录一解封就没了。
+
+```bash
+fw ban export --format csv --since 7d -o attack.csv
+fw ban export --format json --since 24h
+```
+
+CSV 带 UTF-8 BOM（Excel 不加会把中文显示成乱码），列：时间 / IP / 动作 /
+检测源 / 原因 / 命中次数 / 违规次数 / 封禁时长秒。
+
+下面这条也在取证表里：**只观察不封禁**模式下的决策同样留档 ——
+"谁在被盯着"正是你决定阈值该收紧还是放松的依据。
 
 ---
 
@@ -557,6 +660,7 @@ internal/store/      SQLite 持久化（策略、封禁、审计、元数据）
 internal/netcfg/     内核网络参数与接口/路由清点（Linux 实现 + 其他平台桩）
 internal/ban/        自动封禁：检测器（conntrack/日志）+ 判罚引擎
 internal/addrgroup/  地址组加载（CIDR 列表 → 区间集合元素）
+internal/alert/      告警通道（webhook / smtp / command，带去重与异步投递）
 internal/obs/        Prometheus 指标与进程内事件总线
 internal/webui/      Web 管理界面（go:embed 内嵌，无构建步骤）
 internal/config/     守护进程配置加载与校验

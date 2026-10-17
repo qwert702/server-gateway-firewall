@@ -387,3 +387,115 @@ func TestConcurrentBansDoNotCorrupt(t *testing.T) {
 		t.Fatalf("并发写入后读取失败: %v", err)
 	}
 }
+
+// ---- 攻击取证 ----
+
+func TestBanEventLifecycle(t *testing.T) {
+	db := newDB(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	events := []BanEvent{
+		{At: now.Add(-2 * time.Hour), IP: "203.0.113.1", Action: "observe", Source: "conntrack",
+			Reason: "窗口内累计 20", EventCount: 20},
+		{At: now.Add(-1 * time.Hour), IP: "203.0.113.1", Action: "ban", Source: "conntrack",
+			Reason: "达阈值", EventCount: 24, Strikes: 1, TTLSec: 600},
+		{At: now, IP: "203.0.113.1", Action: "unban"},
+	}
+	for _, e := range events {
+		if err := db.AppendBanEvent(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := db.ListBanEvents(ctx, time.Time{}, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("应有 3 条，实际 %d", len(got))
+	}
+	// 倒序：最新的在前
+	if got[0].Action != "unban" {
+		t.Errorf("应按时间倒序返回，实际第一条是 %q", got[0].Action)
+	}
+	// 字段要完整保留 —— 导出投诉时靠的就是这些
+	ban := got[1]
+	if ban.IP != "203.0.113.1" || ban.Source != "conntrack" || ban.Strikes != 1 || ban.TTLSec != 600 {
+		t.Errorf("字段未完整保留: %+v", ban)
+	}
+}
+
+func TestListBanEventsSince(t *testing.T) {
+	db := newDB(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	_ = db.AppendBanEvent(ctx, BanEvent{At: now.Add(-48 * time.Hour), IP: "1.1.1.1", Action: "ban"})
+	_ = db.AppendBanEvent(ctx, BanEvent{At: now.Add(-1 * time.Hour), IP: "2.2.2.2", Action: "ban"})
+
+	got, err := db.ListBanEvents(ctx, now.Add(-24*time.Hour), 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].IP != "2.2.2.2" {
+		t.Errorf("since 过滤不正确: %+v", got)
+	}
+}
+
+// 取证记录只增不删，但必须有保留期，否则库会无限增长。
+func TestPruneBanEvents(t *testing.T) {
+	db := newDB(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	_ = db.AppendBanEvent(ctx, BanEvent{At: now.Add(-100 * 24 * time.Hour), IP: "1.1.1.1", Action: "ban"})
+	_ = db.AppendBanEvent(ctx, BanEvent{At: now.Add(-10 * 24 * time.Hour), IP: "2.2.2.2", Action: "ban"})
+
+	n, err := db.PruneBanEvents(ctx, now.Add(-90*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("应清理 1 条（超过 90 天保留期），实际 %d", n)
+	}
+	got, _ := db.ListBanEvents(ctx, time.Time{}, 100)
+	if len(got) != 1 || got[0].IP != "2.2.2.2" {
+		t.Errorf("保留期内的记录不应被删: %+v", got)
+	}
+}
+
+// 取证记录必须跨重启留存 —— 这正是"事发之后才想起来要查"的前提。
+func TestBanEventsSurviveReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fwdd.db")
+	ctx := context.Background()
+
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AppendBanEvent(ctx, BanEvent{
+		At: time.Now(), IP: "203.0.113.9", Action: "ban",
+		Source: "log:ssh-auth-fail", Reason: "SSH 爆破", EventCount: 12, TTLSec: 3600,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	db2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	got, err := db2.ListBanEvents(ctx, time.Time{}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("重启后取证记录丢失: %+v", got)
+	}
+	if got[0].Source != "log:ssh-auth-fail" || got[0].EventCount != 12 {
+		t.Errorf("重启后字段丢失: %+v", got[0])
+	}
+}

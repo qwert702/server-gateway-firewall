@@ -9,6 +9,21 @@ listen: 127.0.0.1:8080
 # Windows 不支持时留空即可。
 socket: ""
 
+# 部署形态
+#
+#   gateway —— 网关/路由器型：跨网段转发、NAT、多网卡。
+#              会生成 forward 链与两条 nat 链。适合做 LAN↔WAN 之间的网关。
+#   host    —— 主机型：只保护本机，不做转发、不做 NAT。
+#              只生成 input / output 两条链，**不注册 forward 链**。
+#
+# 单网卡的普通服务器（跑 nginx/数据库/应用）应该用 host。
+#
+# 为什么这件事很重要：fwdd 的链优先级是 filter(0)，与 Docker、firewalld 的链
+# **同钩子同优先级**，而 nft 里这种情形的求值顺序是未定义的。网关模式会给
+# forward 挂 policy drop，装在有 Docker 的机器上时容器网络会不会被打断
+# 是看运气的 —— 比确定会坏更难排查。host 模式不注册 forward 链，从根上避开。
+mode: gateway
+
 # 后端：nftables（生产）| mock（离线演示与单测）
 backend: nftables
 
@@ -110,3 +125,45 @@ auto_ban:
   #
   # 关于 nft-limit：本工具生成的限速规则会打内核日志，特征从 SRC= 提取地址，
   # 因此"某地址持续触发限速"会直接进入自动封禁判罚。
+
+# ---- 告警推送 ----
+#
+# 为空表示不推送，只在日志和界面上看。
+#
+# 配置完先跑一次 `fw alert test` 验证通道通不通 —— 不要等真被攻击时
+# 才发现 webhook 地址写错了。
+#
+# 同一事件（类型 + IP）在 alert_cooldown 内只发一次，重复的会合并计数。
+# 一次端口扫描能瞬间产生几十条封禁，逐条推送会把你淹没，然后就没人看了。
+alert_cooldown: 5m
+
+alerts: []
+#  alerts:
+#    # 企业微信群机器人（钉钉把 format 换成 dingtalk 即可，格式相同）
+#    - type: webhook
+#      format: wecom
+#      url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=你的key"
+#
+#    # 飞书群机器人
+#    - {type: webhook, format: feishu, url: "https://open.feishu.cn/open-apis/bot/v2/hook/你的id"}
+#
+#    # Telegram Bot（chat_id 必填）
+#    - {type: webhook, format: telegram, chat_id: "123456", url: "https://api.telegram.org/bot<token>/sendMessage"}
+#
+#    # 自建告警系统：直接 POST 结构化 JSON 事件
+#    - {type: webhook, url: "https://your-endpoint/alerts", token: "可选 Bearer 令牌"}
+#
+#    # 邮件。465 端口用 implicit_tls: true；587 端口用 STARTTLS 则省略该项。
+#    - type: smtp
+#      addr: smtp.qq.com:465
+#      implicit_tls: true
+#      username: you@qq.com
+#      password: "邮箱授权码，不是登录密码"
+#      from: you@qq.com
+#      to: [you@qq.com]
+#      min_severity: warn      # 这个通道只收 warn 及以上
+#
+#    # 本地脚本兜底。事件内容通过环境变量传（FWDD_IP / FWDD_KIND / ...）
+#    # 与 stdin 的 JSON，**不拼进命令行** —— 那些内容来自外部输入。
+#    - {type: command, command: /usr/local/bin/notify.sh}
+

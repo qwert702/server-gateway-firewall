@@ -1,0 +1,101 @@
+# 主机型（单机）防火墙策略示例
+#
+# 适用于**单网卡的普通服务器**：只保护本机，不做转发、不做 NAT。
+#
+# 与网关示例（policy.example.yaml）的区别：
+#   - 不定义安全域（域是给"网段之间"用的，单机上没有这个维度）
+#   - 规则的其中一侧必须是 local（本机）—— 引用 forward 的规则会被拒绝
+#   - 不做 NAT
+#
+# 编译产物只含 input / output 两条链，**不注册 forward 链**。
+# 这一点很重要：fwdd 的链优先级是 filter(0)，与 Docker、firewalld 的链
+# 同钩子同优先级，而 nft 里这种情形的求值顺序是未定义的 —— 多注册一条
+# forward 链挂 policy drop，容器网络会不会被打断就是看运气的。
+#
+# ⚠️ 部署前请务必按实际情况修改：
+#   1. 把 "ssh-from-admin" 里的地址换成你自己固定的管理 IP 或网段
+#   2. 确认下面放行的端口与你实际在跑的服务一致
+#   3. 先跑 `fwdd -mode host -policy 本文件 -dry-run` 看一眼将要写入内核的东西
+
+version: 1
+
+rules:
+  # ---- 放行已建立连接 ----
+  #
+  # 不需要手写：编译器会往 input / output 链首自动注入
+  #   ct state invalid            → drop
+  #   ct state established,related → accept
+  # 这两条。手动再写一条 any → any 的反而会被校验拦下 ——
+  # 那是 forward 规则，主机模式没有 forward 链。
+
+  # ---- 管理入口 ----
+  #
+  # ★ 这是最关键的一条：写错了就把自己关在门外。
+  #   建议先用一个固定的管理 IP 或跳板机地址，确认能用之后再加 ssh-key 之类的加固。
+  #   src_addr 留空表示"任何来源都能连 SSH" —— 那是你现在的情况，
+  #   但既然要做防护，就从这里开始收紧。
+  - id: ssh-from-admin
+    priority: 100
+    src_zone: any
+    dst_zone: local
+    proto: tcp
+    dst_port: ["22"]
+    state: [new, established]
+    action: accept
+    limit: {rate: 12, per: minute, per_ip: true, max_concurrent: 8}
+    comment: SSH 管理入口（带限速防爆破）
+    # src_addr: ["203.0.113.7"]   # ← 填上你的固定管理 IP 后取消注释
+
+  # ---- 对外服务 ----
+  - id: web
+    priority: 200
+    src_zone: any
+    dst_zone: local
+    proto: tcp
+    dst_port: ["80", "443"]
+    state: [new]
+    action: accept
+    limit: {rate: 200, per: second, burst: 400, max_concurrent: 256}
+    comment: HTTP/HTTPS
+
+  # ---- 诊断用 ICMP（限速，别让人拿去放大）----
+  - id: icmp-in
+    priority: 300
+    src_zone: any
+    dst_zone: local
+    proto: icmp
+    state: [new]
+    action: accept
+    limit: {rate: 10, per: second, burst: 20}
+    comment: 允许 ping，但限速
+
+  # ---- 本机可以主动对外（DNS、更新、上报等）----
+  #
+  # 主机型和网关型在这点上不同：单机通常需要自由出网。
+  # 如果你的服务器不该主动外联，把这条删掉、把 default.output 改成 drop，
+  # 然后按需放行具体的出站目标。
+  - id: outbound
+    priority: 500
+    src_zone: local
+    dst_zone: any
+    action: accept
+    comment: 本机主动外联
+
+default:
+  # 输入默认拒绝：这正是主机防火墙的意义。
+  # 上面每条放行规则都是在给这个默认策略开洞，所以洞要开得精确。
+  input: drop
+  # 主机不做转发，这个字段在主机模式下不起作用（不生成 forward 链），
+  # 写在这里只是为了让同一份配置也能被网关模式读取。
+  forward: drop
+  # 本机发出的流量放行；若服务器不该主动外联，改成 drop。
+  output: accept
+
+ban_settings:
+  timeout: 24h
+  whitelist:
+    # ⚠️ 一定要把你自己会用来连这台机器的地址放进来。
+    - 127.0.0.0/8
+    - "::1/128"
+    # - 203.0.113.7      # ← 你的固定管理 IP
+    # - 198.51.100.0/24  # ← 你的办公网段

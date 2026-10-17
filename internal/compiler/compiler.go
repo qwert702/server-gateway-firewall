@@ -39,6 +39,11 @@ type Options struct {
 	ConntrackFastPath bool
 	// Counters 为 true 时每条规则前插入计数器。
 	Counters bool
+	// HostMode 为主机型部署：只保护本机，不生成 forward 链与两条 nat 链。
+	//
+	// 理由见 buildChains 里的说明 —— 核心是避免与 Docker/firewalld 的链
+	// 在同一个钩子同一优先级上撞车（nft 里这种求值顺序是未定义的）。
+	HostMode bool
 	// LogPrefix 为日志前缀，默认 "fw: "。
 	LogPrefix string
 
@@ -68,6 +73,44 @@ type Result struct {
 	ChainRules map[string]int
 }
 
+// validateHostMode 检查策略里有没有只有网关模式才支持的东西。
+//
+// 主机模式不注册 forward 与 nat 链，这类配置必须报错而不是静默丢弃。
+func validateHostMode(p *model.Policy) []model.Problem {
+	var ps []model.Problem
+
+	for i := range p.NATRules {
+		n := &p.NATRules[i]
+		if !n.IsEnabled() {
+			continue
+		}
+		ps = append(ps, model.Problem{
+			Level: "error",
+			Where: fmt.Sprintf("nat_rules[%s]", n.ID),
+			Message: "主机模式不做地址转换：本机模式下不注册 nat 链。" +
+				"若这台机器确实要做网关或 NAT，请把配置里的 mode 设为 gateway",
+		})
+	}
+
+	for i := range p.Rules {
+		r := &p.Rules[i]
+		if !r.IsEnabled() {
+			continue
+		}
+		// 两侧都不是 local 的规则会被投进 forward 链 —— 主机模式下没有这条链。
+		if !isLocal(r.SrcZone) && !isLocal(r.DstZone) {
+			ps = append(ps, model.Problem{
+				Level: "error",
+				Where: fmt.Sprintf("rules[%s]", r.ID),
+				Message: fmt.Sprintf("主机模式没有 forward 链，这条规则（%s → %s）无处可落。"+
+					"只保护本机的规则请把其中一侧设为 zone %q；真要做网关请把 mode 设为 gateway",
+					zoneLabel(r.SrcZone), zoneLabel(r.DstZone), model.ZoneLocal),
+			})
+		}
+	}
+	return ps
+}
+
 // Compile 编译策略。若存在 error 级校验问题则返回错误。
 func Compile(p *model.Policy, opts Options) (*Result, error) {
 	if p == nil {
@@ -84,6 +127,17 @@ func Compile(p *model.Policy, opts Options) (*Result, error) {
 	for _, pr := range problems {
 		if pr.Level == "warning" {
 			warns = append(warns, pr)
+		}
+	}
+
+	// 主机模式下的额外校验。
+	//
+	// 主机模式不生成 forward 链与两条 nat 链，所以引用了这两者的配置是
+	// **配置错误**，必须在编译前拦下 —— 否则那些规则会被静默丢弃，
+	// 表现为"我明明写了这条规则，怎么不生效"。
+	if opts.HostMode {
+		if errs := validateHostMode(p); len(errs) > 0 {
+			return nil, &ValidationError{Problems: errs}
 		}
 	}
 
@@ -313,10 +367,39 @@ func (c *compiler) limitSets(want func(*model.Rule) bool, prefix string) []strin
 // ---- 链 ----
 
 func (c *compiler) buildChains(t *ir.Table) {
-	prerouting := &ir.Chain{Name: "prerouting", Type: ir.ChainNAT, Hook: ir.HookPrerouting, Priority: ir.PrioDstNAT, Base: true, Comment: "DNAT 与入口封禁"}
 	input := &ir.Chain{Name: "input", Type: ir.ChainFilter, Hook: ir.HookInput, Priority: ir.PrioFilter, Base: true, Policy: policyStr(c.policy.Default.Input, model.ActionDrop), Comment: "发往本机"}
-	forward := &ir.Chain{Name: "forward", Type: ir.ChainFilter, Hook: ir.HookForward, Priority: ir.PrioFilter, Base: true, Policy: policyStr(c.policy.Default.Forward, model.ActionDrop), Comment: "跨网段转发"}
 	output := &ir.Chain{Name: "output", Type: ir.ChainFilter, Hook: ir.HookOutput, Priority: ir.PrioFilter, Base: true, Policy: policyStr(c.policy.Default.Output, model.ActionAccept), Comment: "本机发出"}
+
+	// 主机模式只注册 input / output 两条基础链。
+	//
+	// 这不是"少生成几条规则"这么简单：fwdd 的链优先级是 filter(0)，
+	// 与 Docker、firewalld 的链**同钩子同优先级**，而 nft 里这种情形的
+	// 求值顺序是未定义的。网关模式会给 forward 挂 `policy drop`，
+	// 装在有 Docker 的机器上时容器网络会不会被打断是看运气的 ——
+	// 比确定会坏更难排查。不注册 forward 链就从根上没有这个问题。
+	//
+	// 同理不注册两条 `type nat` 链：那不是主机该有的东西。
+	if c.opts.HostMode {
+		c.chains = map[string]*ir.Chain{"input": input, "output": output}
+
+		// 封禁丢弃规则落在 input：主机模式下没有 prerouting，
+		// 而 input 钩子是所有"发给本机"流量的必经之处。
+		c.addBanRules(input)
+
+		if c.opts.ConntrackFastPath {
+			c.addConntrackFastPath(input, output)
+		}
+		c.appendUserRules(nil)
+
+		t.Chains = []*ir.Chain{input, output}
+		for _, ch := range t.Chains {
+			dedupe(ch)
+		}
+		return
+	}
+
+	prerouting := &ir.Chain{Name: "prerouting", Type: ir.ChainNAT, Hook: ir.HookPrerouting, Priority: ir.PrioDstNAT, Base: true, Comment: "DNAT 与入口封禁"}
+	forward := &ir.Chain{Name: "forward", Type: ir.ChainFilter, Hook: ir.HookForward, Priority: ir.PrioFilter, Base: true, Policy: policyStr(c.policy.Default.Forward, model.ActionDrop), Comment: "跨网段转发"}
 	postrouting := &ir.Chain{Name: "postrouting", Type: ir.ChainNAT, Hook: ir.HookPostrouting, Priority: ir.PrioSrcNAT, Base: true, Comment: "SNAT / masquerade"}
 
 	c.chains = map[string]*ir.Chain{
@@ -331,23 +414,39 @@ func (c *compiler) buildChains(t *ir.Table) {
 	c.addBanRules(prerouting)
 
 	if c.opts.ConntrackFastPath {
-		for _, ch := range []*ir.Chain{input, forward, output} {
-			var ctr []ir.Statement
-			if c.opts.Counters {
-				ctr = []ir.Statement{{Kind: ir.StmtCounter}}
-			}
-			ch.Rules = append(ch.Rules,
-				&ir.Rule{ID: ch.Name + "-ct-invalid", Matches: []ir.Match{ir.CtState("invalid")},
-					Stmts:   append(append([]ir.Statement(nil), ctr...), ir.Statement{Kind: ir.StmtVerdict, Verdict: "drop"}),
-					Comment: "丢弃状态异常的连接"},
-				&ir.Rule{ID: ch.Name + "-ct-established", Matches: []ir.Match{ir.CtState("established", "related")},
-					Stmts:   append(append([]ir.Statement(nil), ctr...), ir.Statement{Kind: ir.StmtVerdict, Verdict: "accept"}),
-					Comment: "已建立连接快速通道"},
-			)
-		}
+		c.addConntrackFastPath(input, forward, output)
 	}
+	c.appendUserRules(nil)
 
-	// 用户规则按 Priority 稳定排序。
+	t.Chains = []*ir.Chain{prerouting, input, forward, output, postrouting}
+	for _, ch := range t.Chains {
+		dedupe(ch)
+	}
+}
+
+// addConntrackFastPath 在给定链的首部注入 conntrack 快速通道。
+func (c *compiler) addConntrackFastPath(chains ...*ir.Chain) {
+	var ctr []ir.Statement
+	if c.opts.Counters {
+		ctr = []ir.Statement{{Kind: ir.StmtCounter}}
+	}
+	for _, ch := range chains {
+		ch.Rules = append(ch.Rules,
+			&ir.Rule{ID: ch.Name + "-ct-invalid", Matches: []ir.Match{ir.CtState("invalid")},
+				Stmts:   append(append([]ir.Statement(nil), ctr...), ir.Statement{Kind: ir.StmtVerdict, Verdict: "drop"}),
+				Comment: "丢弃状态异常的连接"},
+			&ir.Rule{ID: ch.Name + "-ct-established", Matches: []ir.Match{ir.CtState("established", "related")},
+				Stmts:   append(append([]ir.Statement(nil), ctr...), ir.Statement{Kind: ir.StmtVerdict, Verdict: "accept"}),
+				Comment: "已建立连接快速通道"},
+		)
+	}
+}
+
+// appendUserRules 把用户规则按优先级稳定排序后编译进各自的链。
+//
+// skip 为需要跳过的链（主机模式下没有 forward，落到它上面的规则已在
+// Compile 阶段被拦下，这里只是兜底）。
+func (c *compiler) appendUserRules(skip *ir.Chain) {
 	rules := make([]model.Rule, 0, len(c.policy.Rules))
 	for _, r := range c.policy.Rules {
 		if r.IsEnabled() {
@@ -358,15 +457,10 @@ func (c *compiler) buildChains(t *ir.Table) {
 
 	for _, r := range rules {
 		chain := c.targetChain(&r)
-		if chain == nil {
+		if chain == nil || chain == skip {
 			continue
 		}
-		compiled := c.compileRule(chain.Name, &r)
-		chain.Rules = append(chain.Rules, compiled...)
-	}
-	t.Chains = []*ir.Chain{prerouting, input, forward, output, postrouting}
-	for _, ch := range t.Chains {
-		dedupe(ch)
+		chain.Rules = append(chain.Rules, c.compileRule(chain.Name, &r)...)
 	}
 }
 
@@ -412,6 +506,11 @@ func (c *compiler) targetChain(r *model.Rule) *ir.Chain {
 func (c *compiler) buildNAT(t *ir.Table) {
 	dnat := c.chains["prerouting"]
 	natOut := c.chains["postrouting"]
+	// 主机模式没有 nat 链。引用它们的配置已在 validateHostMode 里报错，
+	// 这里只是兜底：停用的 NAT 规则不会触发那条校验。
+	if dnat == nil && natOut == nil {
+		return
+	}
 
 	rules := make([]model.NATRule, 0, len(c.policy.NATRules))
 	for _, n := range c.policy.NATRules {
@@ -908,4 +1007,12 @@ func sanitize(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// zoneLabel 把空域名显示成 "any"，让错误信息里的域可读。
+func zoneLabel(z string) string {
+	if z == "" {
+		return model.ZoneAny
+	}
+	return z
 }

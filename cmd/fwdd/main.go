@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"fwdd/internal/alert"
 	"fwdd/internal/api"
 	"fwdd/internal/backend"
 	"fwdd/internal/backend/mock"
@@ -43,6 +45,7 @@ func run() error {
 	var (
 		cfgPath      = flag.String("config", defaultConfigPath(), "配置文件路径（缺失时自动生成）")
 		backendName  = flag.String("backend", "", "覆盖配置中的后端：nftables | mock")
+		mode         = flag.String("mode", "", "覆盖部署形态：gateway（网关，默认）| host（主机）")
 		listen       = flag.String("listen", "", "覆盖 HTTP 监听地址")
 		policyPath   = flag.String("policy", "", "策略文件路径（YAML）")
 		applyStart   = flag.Bool("apply-on-start", true, "启动时把策略下发到内核")
@@ -66,6 +69,9 @@ func run() error {
 	}
 	if *backendName != "" {
 		cfg.Backend = *backendName
+	}
+	if *mode != "" {
+		cfg.Mode = *mode
 	}
 	if *listen != "" {
 		cfg.Listen = *listen
@@ -171,8 +177,15 @@ func run() error {
 	// 后台维护：定期清理已过期的封禁记录。
 	eng.StartMaintenance(ctx)
 
+	// 告警通道：在封禁引擎之前建好，好让判罚结果能直接推出去。
+	alerts, err := buildAlerts(cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer alerts.Close()
+
 	// 自动封禁：检测器 → 判罚引擎 → 封禁执行。
-	banEng, err := buildAutoBan(ctx, cfg, eng, logger)
+	banEng, err := buildAutoBan(ctx, cfg, eng, alerts, logger)
 	if err != nil {
 		return err
 	}
@@ -181,10 +194,11 @@ func run() error {
 	bus := obs.NewBus(300)
 	eng.OnEvent(func(action, target, detail string) {
 		bus.Publish(obs.Event{Kind: action, Target: target, Detail: detail})
+		alertFromAudit(alerts, action, target, detail)
 	})
 	metrics := obs.New(eng, banEng, be.Name(), cfg.Table)
 
-	srv := api.New(cfg, eng, netProvider, banEng, metrics, bus, logger)
+	srv := api.New(cfg, eng, netProvider, banEng, metrics, bus, alerts, logger)
 	logger.Info("fwdd 启动完成", "backend", be.Name())
 	if err := srv.Serve(ctx); err != nil {
 		return err
@@ -232,7 +246,16 @@ func checkNetworking(ctx context.Context, np netcfg.Provider, cfg config.Config,
 	if st, err = np.Read(ctx); err != nil {
 		return
 	}
-	if !st.Forwarding {
+	switch {
+	case cfg.IsHost():
+		// 主机模式下"不转发"是**期望状态**，不是问题。
+		// 这里只在它意外开着时提一句 —— 开着本身无害（没有路由就不会转发），
+		// 但可能说明这台机器上有 Docker 之类的组件在设它。
+		if st.Forwarding {
+			logger.Info("检测到 IPv4 转发已开启（主机模式下不需要；通常是 Docker 等组件设的）",
+				"提示", "主机模式不注册 forward 链，因此与它不冲突")
+		}
+	case !st.Forwarding:
 		logger.Warn("⚠ IPv4 转发未开启：跨网段流量不会经过 forward 钩子，防火墙策略对它完全不生效",
 			"修复", "sysctl -w net.ipv4.ip_forward=1，或在配置中设置 manage_sysctls: true")
 	}
@@ -247,7 +270,7 @@ func checkNetworking(ctx context.Context, np netcfg.Provider, cfg config.Config,
 //
 // 关键取舍：默认只观察不封禁（auto_ban.enabled=false）。误封一个有合法用途的
 // 地址（监控探针、NAT 出口、爬虫）比漏封更难收拾，应该先看一段真实流量再打开。
-func buildAutoBan(ctx context.Context, cfg config.Config, eng *engine.Engine, logger *slog.Logger) (*ban.Engine, error) {
+func buildAutoBan(ctx context.Context, cfg config.Config, eng *engine.Engine, alerts *alert.Manager, logger *slog.Logger) (*ban.Engine, error) {
 	ab := cfg.AutoBan
 
 	// 未配置任何检测器时，enabled 本身就意味着"用 conntrack 检测"，
@@ -264,12 +287,46 @@ func buildAutoBan(ctx context.Context, cfg config.Config, eng *engine.Engine, lo
 
 	settings := cfg.BanSettings()
 	be, err := ban.New(settings, ban.WithDecisionHook(func(d ban.Decision) {
-		if d.Action == ban.ActionBan {
+		switch d.Action {
+		case ban.ActionBan:
 			logger.Warn("自动封禁",
 				"ip", d.IP, "ttl", d.TTL.String(), "第几次", d.Strikes, "原因", d.Reason)
-		} else if d.Action == ban.ActionObserve {
+			alerts.Send(alert.Event{
+				Severity: alert.SevWarn,
+				Kind:     "autoban",
+				IP:       d.IP,
+				Title:    fmt.Sprintf("自动封禁 %s（第 %d 次，%s）", d.IP, d.Strikes, d.TTL),
+				Detail:   d.Reason,
+			})
+		case ban.ActionObserve:
 			logger.Info("达到封禁阈值但未开启自动封禁（观察模式）",
 				"ip", d.IP, "原因", d.Reason)
+			// 观察模式下也推：这正是"先看一段时间有没有误报"要用的信息。
+			alerts.Send(alert.Event{
+				Severity: alert.SevInfo,
+				Kind:     "observe",
+				IP:       d.IP,
+				Title:    fmt.Sprintf("可疑来源 %s 已达阈值（当前只观察不封禁）", d.IP),
+				Detail:   d.Reason,
+			})
+		}
+		// 取证记录：判罚决策在这里留档，因为只有这里同时有
+		// "窗口内命中多少次""第几次违规"这些细节。
+		// 手工封禁由 engine.Ban 记录（那条路没有判罚引擎的上下文）。
+		switch d.Action {
+		case ban.ActionBan:
+			eng.RecordAttackEvent(ctx, store.BanEvent{
+				At: d.At, IP: d.IP, Action: "ban",
+				Source: strings.Join(d.Sources, ","),
+				Reason: d.Reason, EventCount: d.EventCount, Strikes: d.Strikes,
+				TTL: d.TTL,
+			})
+		case ban.ActionObserve:
+			eng.RecordAttackEvent(ctx, store.BanEvent{
+				At: d.At, IP: d.IP, Action: "observe",
+				Source: strings.Join(d.Sources, ","),
+				Reason: d.Reason, EventCount: d.EventCount, Strikes: d.Strikes,
+			})
 		}
 	}))
 	if err != nil {
@@ -344,6 +401,51 @@ func orDefault(d, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// buildAlerts 按配置装配告警通道。
+func buildAlerts(cfg config.Config, logger *slog.Logger) (*alert.Manager, error) {
+	notifiers, err := cfg.Notifiers()
+	if err != nil {
+		return nil, err
+	}
+	if len(notifiers) == 0 {
+		logger.Info("未配置告警通道（配置里的 alerts），只记录不推送")
+		return alert.New(nil, alert.WithLogger(logger)), nil
+	}
+	m := alert.New(notifiers,
+		alert.WithLogger(logger),
+		alert.WithCooldown(cfg.AlertCooldown),
+	)
+	names := m.Notifiers()
+	logger.Info("告警通道已就绪", "通道", strings.Join(names, ", "), "数量", len(names))
+	return m, nil
+}
+
+// alertFromAudit 把审计动作翻译成告警。
+//
+// 不是每个审计动作都值得推送 —— 规则增删是你自己的操作，你当然知道。
+// 值得推的是"你没做、但它发生了"的事：自动回滚、下发失败、解封失败。
+func alertFromAudit(m *alert.Manager, action, target, detail string) {
+	if !m.Enabled() {
+		return
+	}
+	switch action {
+	case "rollback", "rollback.reset":
+		m.Send(alert.Event{
+			Severity: alert.SevWarn,
+			Kind:     "rollback",
+			Title:    "防火墙规则被回滚",
+			Detail:   fmt.Sprintf("%s\n%s", target, detail),
+		})
+	case "groups.reload":
+		m.Send(alert.Event{
+			Severity: alert.SevInfo,
+			Kind:     "groups.reload",
+			Title:    "地址组内容已变化，需要重新下发才生效",
+			Detail:   detail,
+		})
+	}
 }
 
 func buildBackend(cfg config.Config, logger *slog.Logger) (backend.Backend, error) {

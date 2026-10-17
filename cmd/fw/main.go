@@ -64,6 +64,8 @@ const usage = `fw —— 服务器网关防火墙命令行
   fw ban add <ip> [--ttl 秒] [--reason 文本]
   fw ban list
   fw ban rm <ip>
+  fw ban export [--format csv|json] [--since 7d] [-o 文件]
+                                   导出攻击取证记录（给云厂商/CERT 投诉用）
 
   fw ban engine [--enable|--disable]  自动封禁引擎状态与开关
   fw ban offenders                 查看被跟踪的可疑地址
@@ -75,7 +77,15 @@ const usage = `fw —— 服务器网关防火墙命令行
   fw groups                        列出地址组（国家封锁、威胁情报列表）
   fw groups reload                 重新读取地址组文件（不自动下发）
 
+  fw alert                         查看告警通道状态
+  fw alert test                    发一条测试告警（配置完通道后先验一下）
+
 注意：zone/rule/nat 的改动只写入期望状态，需要 fw apply 才下发到内核。
+
+当前部署形态来自配置文件的 mode 字段：
+  gateway（默认）—— 网关型，有安全域与 NAT
+  host           —— 主机型，只剩本机防护；引用 forward 的规则会被拒绝，
+                    规则里必须有一侧是 local（本机）
 
 全局参数:
   -config 路径   配置文件（默认 /etc/fwdd/config.yaml 或 $FWDD_CONFIG）
@@ -109,6 +119,7 @@ func run(args []string, out *os.File) error {
 	if err != nil {
 		return err
 	}
+	currentMode = cfg.Mode
 	c := client.New(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -167,6 +178,8 @@ func run(args []string, out *os.File) error {
 		return cmdNet(ctx, c, out, format, sub)
 	case "groups", "group":
 		return cmdGroups(ctx, c, out, format, sub)
+	case "alert", "alerts":
+		return cmdAlert(ctx, c, out, format, sub)
 	case "ban":
 		return cmdBan(ctx, c, out, format, sub)
 	default:
@@ -591,7 +604,9 @@ func parseRuleFlags(args []string) (model.Rule, error) {
 	fs.StringVar(&r.ID, "id", "", "规则 id（留空自动生成）")
 	fs.IntVar(&r.Priority, "priority", 0, "优先级，小的先匹配（留空排到末尾）")
 	fs.StringVar(&r.SrcZone, "src-zone", model.ZoneAny, "源域")
-	fs.StringVar(&r.DstZone, "dst-zone", model.ZoneAny, "目的域（local 表示本机）")
+	// 主机模式下默认目的域是 local —— any 结尾的规则会被判为 forward 规则而拒绝，
+	// 默认成 any 等于让用户每次都撞一次墙。
+	fs.StringVar(&r.DstZone, "dst-zone", defaultDstZone(), "目的域（local 表示本机）")
 	proto := fs.String("proto", "", "协议：tcp|udp|icmp|icmpv6|any")
 	srcAddr := fs.String("src", "", "源地址列表，逗号分隔")
 	dstAddr := fs.String("dst", "", "目的地址列表，逗号分隔")
@@ -1062,6 +1077,59 @@ func cmdGroups(ctx context.Context, c *client.Client, out *os.File, format strin
 	return w.Flush()
 }
 
+func cmdAlert(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
+	if len(args) > 0 && args[0] == "test" {
+		fs := flag.NewFlagSet("alert test", flag.ContinueOnError)
+		title := fs.String("title", "", "自定义测试消息的标题")
+		if _, err := parseInterspersed(fs, args[1:]); err != nil {
+			return err
+		}
+		var resp struct {
+			OK       bool     `json:"ok"`
+			Channels []string `json:"channels"`
+			Errors   []string `json:"errors"`
+		}
+		body := map[string]any{"title": *title}
+		if err := c.Post(ctx, "/alerts/test", body, &resp); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "✅ 已向 %d 个通道发送测试告警: %s\n",
+			len(resp.Channels), strings.Join(resp.Channels, ", "))
+		fmt.Fprintln(out, "请检查你的手机/群里是否收到。")
+		return nil
+	}
+
+	var resp struct {
+		Enabled  bool     `json:"enabled"`
+		Channels []string `json:"channels"`
+		Sent     int64    `json:"sent"`
+		Merged   int64    `json:"merged"`
+		Dropped  int64    `json:"dropped"`
+	}
+	if err := c.Get(ctx, "/alerts", &resp); err != nil {
+		return err
+	}
+	if format == "json" {
+		return printJSON(out, resp)
+	}
+	if !resp.Enabled {
+		fmt.Fprintln(out, "未配置告警通道。")
+		fmt.Fprintln(out, "在配置文件的 alerts 里加一条，例如：")
+		fmt.Fprintln(out, `  alerts:`)
+		fmt.Fprintln(out, `    - {type: webhook, url: "https://qyapi.weixin.qq.com/...", format: wecom}`)
+		fmt.Fprintln(out, `    - {type: smtp, addr: "smtp.qq.com:465", implicit_tls: true, from: you@qq.com, to: [you@qq.com], username: you@qq.com, password: "授权码"}`)
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintf(w, "通道\t%s\n", strings.Join(resp.Channels, ", "))
+	fmt.Fprintf(w, "已发送\t%d\n", resp.Sent)
+	fmt.Fprintf(w, "已合并\t%d（去重窗口内的重复事件）\n", resp.Merged)
+	if resp.Dropped > 0 {
+		fmt.Fprintf(w, "已丢弃\t%d（队列满，说明有通道严重卡住）\n", resp.Dropped)
+	}
+	return w.Flush()
+}
+
 func cmdBan(ctx context.Context, c *client.Client, out *os.File, format string, args []string) error {
 	if len(args) == 0 {
 		return errors.New("用法: fw ban add|list|rm")
@@ -1110,6 +1178,31 @@ func cmdBan(ctx context.Context, c *client.Client, out *os.File, format string, 
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", b.IP, remaining(b, now), orDash(string(b.Source)), orDash(b.Reason))
 		}
 		return w.Flush()
+	case "export":
+		fs := flag.NewFlagSet("ban export", flag.ContinueOnError)
+		format := fs.String("format", "csv", "导出格式：csv | json")
+		since := fs.String("since", "", "起始时间：24h / 7d / 2026-01-01T00:00:00Z；留空为全部")
+		outFile := fs.String("o", "", "输出文件；留空打印到标准输出")
+		if _, err := parseInterspersed(fs, args[1:]); err != nil {
+			return err
+		}
+		text, err := c.GetText(ctx, client.Query("/bans/export", map[string]string{
+			"format": *format, "since": *since,
+		}))
+		if err != nil {
+			return err
+		}
+		text = strings.TrimPrefix(text, "ï»¿") // 去掉导出文件开头的 BOM，避免重复
+		if *outFile == "" {
+			fmt.Fprint(out, text)
+			return nil
+		}
+		if err := os.WriteFile(*outFile, []byte(text), 0o600); err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "已导出到 %s\n", *outFile)
+		return nil
+
 	case "engine":
 		return cmdBanEngine(ctx, c, out, format, args[1:])
 	case "offenders":
@@ -1250,4 +1343,17 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// currentMode 是本次命令行读取到的部署形态。
+//
+// CLI 的各个子命令都从 run() 分发，把 mode 一路传下去会改动一串签名，
+// 而它只影响"默认值"这类小事 —— 用包级变量更划算。
+var currentMode string
+
+func defaultDstZone() string {
+	if currentMode == "host" {
+		return model.ZoneLocal
+	}
+	return model.ZoneAny
 }

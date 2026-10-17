@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"fwdd/internal/alert"
 	"fwdd/internal/ban"
 	"fwdd/internal/compiler"
 	"fwdd/internal/config"
@@ -34,13 +36,14 @@ type Server struct {
 	metrics *obs.Metrics
 	bus     *obs.Bus
 	ban     *ban.Engine
+	alerts  *alert.Manager
 	log     *slog.Logger
 	mux     *http.ServeMux
 	start   time.Time
 }
 
 // New 构造 API 服务。
-func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, banEng *ban.Engine, metrics *obs.Metrics, bus *obs.Bus, log *slog.Logger) *Server {
+func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, banEng *ban.Engine, metrics *obs.Metrics, bus *obs.Bus, alerts *alert.Manager, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -49,7 +52,7 @@ func New(cfg config.Config, e *engine.Engine, net netcfg.Provider, banEng *ban.E
 	}
 	s := &Server{
 		cfg: cfg, engine: e, net: net, ban: banEng,
-		metrics: metrics, bus: bus,
+		metrics: metrics, bus: bus, alerts: alerts,
 		log: log, mux: http.NewServeMux(), start: time.Now(),
 	}
 	s.routes()
@@ -115,6 +118,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE "+p+"/nat/{id}", s.handleDeleteNAT)
 
 	s.mux.HandleFunc("GET "+p+"/config", s.handleGetConfig)
+
+	s.mux.HandleFunc("GET "+p+"/bans/export", s.handleBanExport)
+
+	s.mux.HandleFunc("GET "+p+"/alerts", s.handleAlertStatus)
+	s.mux.HandleFunc("POST "+p+"/alerts/test", s.handleAlertTest)
 
 	s.mux.HandleFunc("GET "+p+"/groups", s.handleGroups)
 	s.mux.HandleFunc("POST "+p+"/groups/reload", s.handleReloadGroups)
@@ -410,6 +418,137 @@ func (s *Server) handleReloadGroups(w http.ResponseWriter, r *http.Request) {
 		"changed": changed,
 		"note":    map[bool]string{true: "内容已变化，需要 apply 才生效", false: "内容无变化"}[changed],
 	})
+}
+
+// ---- 告警 ----
+
+func (s *Server) handleAlertStatus(w http.ResponseWriter, r *http.Request) {
+	if s.alerts == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false, "channels": []string{}})
+		return
+	}
+	sent, merged, dropped := s.alerts.Stats()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":  s.alerts.Enabled(),
+		"channels": s.alerts.Notifiers(),
+		"sent":     sent,
+		"merged":   merged,
+		"dropped":  dropped,
+	})
+}
+
+// handleAlertTest 立刻发一条测试告警并**同步等待结果**。
+//
+// 这是唯一同步发送的地方：配置完通道后你需要立刻知道"通不通"，
+// 而不是等下次真被攻击时才发现 webhook 写错了。
+func (s *Server) handleAlertTest(w http.ResponseWriter, r *http.Request) {
+	if s.alerts == nil || !s.alerts.Enabled() {
+		writeError(w, http.StatusNotImplemented, "未配置告警通道（配置里的 alerts）")
+		return
+	}
+	var req struct {
+		Title string `json:"title"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	title := req.Title
+	if title == "" {
+		title = "这是一条测试告警"
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	errs := s.alerts.SendSync(ctx, alert.Event{
+		Severity: alert.SevInfo,
+		Kind:     "test",
+		Title:    title,
+		Detail:   "如果收到这条消息，说明告警通道配置正确。",
+	})
+
+	if len(errs) > 0 {
+		msgs := make([]string, 0, len(errs))
+		for _, e := range errs {
+			msgs = append(msgs, e.Error())
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok": false, "channels": s.alerts.Notifiers(), "errors": msgs,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "channels": s.alerts.Notifiers(),
+	})
+}
+
+// ---- 攻击取证 ----
+
+// handleBanExport 导出攻击事件，供向云厂商或 CERT 投诉使用。
+//
+// 与 /bans 的区别：/bans 是"当前封着谁"（解封就没了）；
+// 这里导出的是"曾经发生过什么"，只增不删、带保留期。
+func (s *Server) handleBanExport(w http.ResponseWriter, r *http.Request) {
+	since, err := parseSince(r.URL.Query().Get("since"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit := intParam(r, "limit", 10000)
+	if limit > 100000 {
+		limit = 100000
+	}
+
+	events, err := s.engine.ListAttackEvents(r.Context(), since, limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	switch strings.ToLower(r.URL.Query().Get("format")) {
+	case "csv":
+		w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+		w.Header().Set("Content-Disposition", `attachment; filename="fwdd-attack-events.csv"`)
+		// BOM：Excel 不加这个会把中文显示成乱码，而这份文件多半是拿去
+		// 交给别人看的，编码问题在这一步暴露代价最大。
+		_, _ = w.Write([]byte{0xEF, 0xBB, 0xBF})
+		cw := csv.NewWriter(w)
+		_ = cw.Write([]string{"时间", "IP", "动作", "检测源", "原因", "命中次数", "违规次数", "封禁时长秒"})
+		for _, e := range events {
+			_ = cw.Write([]string{
+				e.At.Format(time.RFC3339), e.IP, e.Action, e.Source, e.Reason,
+				strconv.Itoa(e.EventCount), strconv.Itoa(e.Strikes), strconv.Itoa(e.TTLSec),
+			})
+		}
+		cw.Flush()
+	default:
+		if events == nil {
+			events = []store.BanEvent{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"events": events,
+			"count":  len(events),
+			"since":  since,
+			"note":   "这是攻击取证记录（只增不删）。当前生效的封禁见 /bans。",
+		})
+	}
+}
+
+// parseSince 解析 "7d" / "24h" / RFC3339 三种写法。
+func parseSince(v string) (time.Time, error) {
+	if v == "" {
+		return time.Time{}, nil
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return time.Now().Add(-d), nil
+	}
+	// 支持 "7d" 这种 time.ParseDuration 不认的天数写法
+	if strings.HasSuffix(v, "d") {
+		if n, err := strconv.Atoi(strings.TrimSuffix(v, "d")); err == nil {
+			return time.Now().AddDate(0, 0, -n), nil
+		}
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("since 格式无法识别 %q（支持 24h / 7d / RFC3339 时间）", v)
 }
 
 // ---- 可观测性 ----

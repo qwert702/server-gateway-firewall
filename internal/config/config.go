@@ -5,6 +5,7 @@
 package config
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"fwdd/internal/netcfg"
 
+	"fwdd/internal/alert"
 	"fwdd/internal/ban"
 
 	"gopkg.in/yaml.v3"
@@ -29,6 +31,18 @@ type Config struct {
 
 	// Backend 为 "nftables" 或 "mock"。
 	Backend string `yaml:"backend" json:"backend"`
+	// Mode 决定部署形态：
+	//
+	//	gateway —— 网关/路由器型：跨网段转发、NAT、多网卡。会生成
+	//	           forward 链与两条 nat 链。默认值，保持既有行为。
+	//	host    —— 主机型：只保护本机，不做转发、不做 NAT。
+	//	           不生成 forward 链与 nat 链。
+	//
+	// 主机模式不只是"少几条规则"，它避免了一个实打实的冲突：fwdd 的链优先级
+	// 是 filter(0)，与 Docker、firewalld 的链**同钩子同优先级**，而 nft 里
+	// 这种情形的求值顺序是未定义的 —— 网关模式装在有 Docker 的机器上，
+	// 容器网络会不会被打断是看运气的。主机模式不注册 forward 链，从根上避开。
+	Mode string `yaml:"mode" json:"mode"`
 	// Table / Family 指定 nft 表名与地址族。
 	Table  string `yaml:"table" json:"table"`
 	Family string `yaml:"family" json:"family"`
@@ -61,6 +75,104 @@ type Config struct {
 
 	// AutoBan 是自动封禁配置。
 	AutoBan AutoBanConfig `yaml:"auto_ban" json:"auto_ban"`
+
+	// Alerts 是告警通道列表。为空表示不推送告警。
+	Alerts []AlertConfig `yaml:"alerts" json:"alerts,omitempty"`
+	// AlertCooldown 是同一事件的去重窗口（默认 5 分钟）。
+	//
+	// 一次端口扫描可能瞬间产生几十条封禁，逐条推送会把你淹没，
+	// 然后你就开始忽略告警了 —— 那比没有告警更糟。
+	AlertCooldown time.Duration `yaml:"alert_cooldown" json:"alert_cooldown"`
+}
+
+// AlertConfig 是一个告警通道的配置。
+//
+// 用一个扁平结构 + type 区分，而不是嵌套：配置文件里写起来短，
+// 而各类型的字段名不冲突（url / addr / command）。
+type AlertConfig struct {
+	// Type 为 webhook | smtp | command。
+	Type string `yaml:"type" json:"type"`
+	// MinSeverity 低于该级别的告警不发到这个通道（info | warn | critical）。
+	MinSeverity string `yaml:"min_severity" json:"min_severity,omitempty"`
+
+	// ---- webhook ----
+	URL string `yaml:"url" json:"url,omitempty"`
+	// Format 为 generic | wecom | dingtalk | feishu | telegram。
+	// generic 发结构化 JSON 给自建系统；其余几家按各自的机器人格式发送。
+	Format string `yaml:"format" json:"format,omitempty"`
+	// ChatID 仅 telegram 需要。
+	ChatID string `yaml:"chat_id" json:"chat_id,omitempty"`
+	// Token 会作为 Authorization: Bearer 头发送。
+	Token string `yaml:"token" json:"token,omitempty"`
+
+	// ---- smtp ----
+	Addr        string   `yaml:"addr" json:"addr,omitempty"`
+	Username    string   `yaml:"username" json:"username,omitempty"`
+	Password    string   `yaml:"password" json:"password,omitempty"`
+	From        string   `yaml:"from" json:"from,omitempty"`
+	To          []string `yaml:"to" json:"to,omitempty"`
+	ImplicitTLS bool     `yaml:"implicit_tls" json:"implicit_tls,omitempty"`
+
+	// ---- command ----
+	Command string   `yaml:"command" json:"command,omitempty"`
+	Args    []string `yaml:"args" json:"args,omitempty"`
+}
+
+// Notifiers 把配置转换成实际的告警通道。
+//
+// 任何一个通道配置错误都会直接返回错误而不是跳过 —— 少了一个告警通道
+// 意味着你以为有人在看着，实际上没有。
+func (c *Config) Notifiers() ([]alert.Notifier, error) {
+	var out []alert.Notifier
+	for i, a := range c.Alerts {
+		sev, err := alert.ParseSeverity(a.MinSeverity)
+		if err != nil {
+			return nil, fmt.Errorf("alerts[%d]: %w", i, err)
+		}
+		var (
+			n    alert.Notifier
+			err2 error
+		)
+		switch a.Type {
+		case "webhook":
+			n, err2 = alert.NewWebhook(alert.WebhookOptions{
+				URL: a.URL, Format: alert.WebhookFormat(a.Format),
+				ChatID: a.ChatID, Token: a.Token,
+			})
+		case "smtp":
+			n, err2 = alert.NewSMTP(alert.SMTPOptions{
+				Addr: a.Addr, Username: a.Username, Password: a.Password,
+				From: a.From, To: a.To, ImplicitTLS: a.ImplicitTLS,
+			})
+		case "command":
+			n, err2 = alert.NewCommand(alert.CommandOptions{Command: a.Command, Args: a.Args})
+		case "":
+			err2 = fmt.Errorf("缺少 type（应为 webhook | smtp | command）")
+		default:
+			err2 = fmt.Errorf("未知的通道类型 %q", a.Type)
+		}
+		if err2 != nil {
+			return nil, fmt.Errorf("alerts[%d] (%s): %w", i, a.Type, err2)
+		}
+		// 通道级别的严重度过滤在构建时包一层，避免每条消息都判断。
+		out = append(out, &severityFiltered{inner: n, min: sev})
+	}
+	return out, nil
+}
+
+// severityFiltered 是一个按级别过滤的装饰器。
+type severityFiltered struct {
+	inner alert.Notifier
+	min   alert.Severity
+}
+
+func (s *severityFiltered) Name() string { return s.inner.Name() }
+
+func (s *severityFiltered) Notify(ctx context.Context, ev alert.Event) error {
+	if !ev.Severity.AtLeast(s.min) {
+		return nil
+	}
+	return s.inner.Notify(ctx, ev)
 }
 
 // AutoBanConfig 是自动封禁的配置（yaml 可读形态）。
@@ -138,10 +250,28 @@ func (c *Config) BanSettings() ban.Settings {
 	return s
 }
 
-// SysctlBaseline 返回本次启动应使用的内核参数基线。
+// 部署形态。
+const (
+	// ModeGateway 是网关/路由器型：转发、NAT、多网卡。
+	ModeGateway = "gateway"
+	// ModeHost 是主机型：只保护本机。
+	ModeHost = "host"
+)
+
+// IsHost 报告当前是否为主机型部署。
+func (c *Config) IsHost() bool { return c.Mode == ModeHost }
+
+// SysctlBaseline 返回本次启动应使用的内核参数基线，按部署形态选择。
+//
+// 两者的差别不只是"少一项"：网关基线把 rp_filter 设成 0（多宿主/非对称路由
+// 场景下避免误丢包），而**主机上应该设 1** —— 反向路径过滤是内核自带的
+// 反欺骗机制，在单机上网关基线等于主动把它关掉。
 func (c *Config) SysctlBaseline() []netcfg.Sysctl {
 	if len(c.Sysctls) > 0 {
 		return c.Sysctls
+	}
+	if c.IsHost() {
+		return netcfg.HostBaseline()
 	}
 	return netcfg.GatewayBaseline()
 }
@@ -164,6 +294,7 @@ func Default() Config {
 		Listen:   "127.0.0.1:8080",
 		Socket:   socket,
 		Backend:  "nftables",
+		Mode:     ModeGateway,
 		Table:    "fw",
 		Family:   "inet",
 		DataDir:  defaultDataDir(),
@@ -231,6 +362,14 @@ func Save(path string, cfg Config) error {
 
 // Validate 校验配置并补齐派生默认值。
 func (c *Config) Validate() error {
+	switch c.Mode {
+	case "", ModeGateway, ModeHost:
+	default:
+		return fmt.Errorf("mode %q 未知（应为 %s 或 %s）", c.Mode, ModeGateway, ModeHost)
+	}
+	if c.Mode == "" {
+		c.Mode = ModeGateway
+	}
 	switch c.Backend {
 	case "", "nftables", "mock":
 	default:

@@ -130,6 +130,26 @@ func GatewayBaseline() []Sysctl {
 	}
 }
 
+// HostBaseline 返回主机（非网关）场景的推荐参数。
+//
+// 与网关基线有三处实质差别，不是"少一项"那么简单：
+//
+//   - **不含 ip_forward**。主机不做转发。把它设成 1 会让这台机器意外成为
+//     路由器（如果还有第二个网卡或隧道），也让人误以为它在做转发。
+//   - **rp_filter = 1**。反向路径过滤是内核自带的反欺骗机制。网关基线把它
+//     设成 0 是为了在多宿主/非对称路由下避免误丢包；单机上没有这个顾虑，
+//     关掉它纯属削弱防护。
+//   - 保留 tcp_syncookies。
+//
+// 注意：如果这台机器上跑 Docker，ip_forward 会是 1（Docker 自己设的），
+// 那是正常的，主机模式不与之冲突 —— 主机模式压根不注册 forward 链。
+func HostBaseline() []Sysctl {
+	return []Sysctl{
+		{Key: KeySyncookies, Value: "1"},
+		{Key: KeyRPFilter, Value: "1"},
+	}
+}
+
 // NormalizeKey 把 sysctl 的两种写法统一为点分格式。
 //
 // 内核与 sysctl(8) 接受 "net.ipv4.ip_forward" 与 "net/ipv4/ip_forward" 两种写法，

@@ -120,6 +120,26 @@ CREATE TABLE IF NOT EXISTS kv (
   key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
+
+-- ban_events 是攻击取证的原始记录。
+--
+-- 与 ban_entries 的区别：那张表是"当前封着谁"（会被解封/过期删除），
+-- 这张表是"曾经发生过什么"（只增不删，按保留期清理）。
+-- 导出给云厂商或 CERT 投诉时要的是后者 —— 封禁记录被解封就没了，
+-- 而"某 IP 在什么时间以什么特征打了多少次"才是能用的证据。
+CREATE TABLE IF NOT EXISTS ban_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  at          INTEGER NOT NULL,
+  ip          TEXT    NOT NULL,
+  action      TEXT    NOT NULL DEFAULT '',   -- ban | observe | unban
+  source      TEXT    NOT NULL DEFAULT '',   -- 检测源，逗号分隔
+  reason      TEXT    NOT NULL DEFAULT '',
+  event_count INTEGER NOT NULL DEFAULT 0,
+  strikes     INTEGER NOT NULL DEFAULT 0,
+  ttl_sec     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS ban_events_at ON ban_events(at);
+CREATE INDEX IF NOT EXISTS ban_events_ip ON ban_events(ip);
 `
 	if _, err := d.db.ExecContext(ctx, schema); err != nil {
 		return fmt.Errorf("初始化表结构失败: %w", err)
@@ -295,6 +315,95 @@ func (d *DB) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// ---- 攻击取证 ----
+
+// BanEvent 是一次攻击检测记录，用于取证与导出。
+//
+// 与 BanEntry 的区别：BanEntry 是"当前封着谁"（解封或过期就没了）；
+// BanEvent 是"曾经发生过什么"（只增不删）。导出给云厂商或 CERT 投诉时
+// 要的是后者 —— "某 IP 在什么时间以什么特征打了多少次"才是能用的证据。
+type BanEvent struct {
+	ID     int64     `json:"id,omitempty"`
+	At     time.Time `json:"at"`
+	IP     string    `json:"ip"`
+	Action string    `json:"action"` // ban | observe | unban
+	Source string    `json:"source,omitempty"`
+	Reason string    `json:"reason,omitempty"`
+	// EventCount 是触发判罚时窗口内累计的事件条数。
+	EventCount int           `json:"event_count,omitempty"`
+	Strikes    int           `json:"strikes,omitempty"`
+	TTL        time.Duration `json:"-"`
+	TTLSec     int           `json:"ttl_sec,omitempty"`
+}
+
+// AppendBanEvent 追加一条攻击事件记录。
+func (d *DB) AppendBanEvent(ctx context.Context, e BanEvent) error {
+	ttl := e.TTLSec
+	if ttl == 0 && e.TTL > 0 {
+		ttl = int(e.TTL / time.Second)
+	}
+	at := e.At
+	if at.IsZero() {
+		at = d.now()
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO ban_events (at, ip, action, source, reason, event_count, strikes, ttl_sec)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		at.Unix(), e.IP, e.Action, e.Source, e.Reason, e.EventCount, e.Strikes, ttl)
+	if err != nil {
+		return fmt.Errorf("写入攻击事件失败: %w", err)
+	}
+	return nil
+}
+
+// ListBanEvents 按时间倒序返回攻击事件；since 为零值时返回全部。
+func (d *DB) ListBanEvents(ctx context.Context, since time.Time, limit int) ([]BanEvent, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	q := `SELECT id, at, ip, action, source, reason, event_count, strikes, ttl_sec FROM ban_events`
+	args := []any{}
+	if !since.IsZero() {
+		q += ` WHERE at >= ?`
+		args = append(args, since.Unix())
+	}
+	q += ` ORDER BY at DESC, id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := d.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("读取攻击事件失败: %w", err)
+	}
+	defer rows.Close()
+
+	var out []BanEvent
+	for rows.Next() {
+		var (
+			e  BanEvent
+			at int64
+		)
+		if err := rows.Scan(&e.ID, &at, &e.IP, &e.Action, &e.Source, &e.Reason,
+			&e.EventCount, &e.Strikes, &e.TTLSec); err != nil {
+			return nil, fmt.Errorf("解析攻击事件失败: %w", err)
+		}
+		e.At = time.Unix(at, 0)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// PruneBanEvents 删除早于 before 的记录，返回删除条数。
+//
+// 取证数据要留得住，但也不能无限增长。默认保留 90 天。
+func (d *DB) PruneBanEvents(ctx context.Context, before time.Time) (int64, error) {
+	res, err := d.db.ExecContext(ctx, "DELETE FROM ban_events WHERE at < ?", before.Unix())
+	if err != nil {
+		return 0, fmt.Errorf("清理攻击事件失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // ---- 元数据 ----
